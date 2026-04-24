@@ -1,0 +1,12 @@
+pass
+pass_received
+shot
+interception
+recovery
+goal
+ball_out_of_play
+tackle
+aerial_duel
+save
+clearance
+foul

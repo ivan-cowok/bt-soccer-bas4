@@ -1,0 +1,70 @@
+{
+  "paths": {
+    "frame_dir": "E:/Database/44/soccer_data_frames",
+    "save_dir": "D:\\work\\44\\AdaSpot-main\\checkpoints\\soccernetball"
+  },
+  "data": {
+    "dataset": "soccernetball",
+    "data_dir": "data/soccernetball",
+    "num_classes": 12,
+    "clip_len": 100,
+    "epoch_num_frames": 200000,
+    "val_epoch_num_frames": 100000,
+    "mixup": true,
+    "store_mode": "store"
+  },
+  "training": {
+    "batch_size": 1,
+    "num_epochs": 30,
+    "warm_up_epochs": 3,
+    "start_val_epoch": 5,
+    "learning_rate": 0.0002,
+    "only_test": false,
+    "criterion": "loss",
+    "num_workers": 0,
+    "lowres_loss": true,
+    "highres_loss": true,
+    "freeze_backbone_epochs": 5,
+    "skip_empty_clips": true
+  },
+  "model": {
+    "hr_dim": [
+      448,
+      796
+    ],
+    "hr_crop": [
+      448,
+      796
+    ],
+    "lr_dim": [
+      224,
+      398
+    ],
+    "lr_crop": [
+      224,
+      398
+    ],
+    "roi_size": [
+      112,
+      112
+    ],
+    "feature_arch": "rny004_gsf",
+    "blocks_temporal": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "aggregation": "max",
+    "temporal_arch": "gru",
+    "threshold": 0.0,
+    "padding": "replicate",
+    "roi_channel_reduce": "mean_max",
+    "roi_spatial_increase": 10,
+    "roi_size_step": 28,
+    "use_full_hr": true,
+    "use_cbam": true,
+    "pretrained": false,
+    "init_checkpoint": "config/pretrained/SoccernetBall_Big/checkpoint_best.pt"
+  }
+}
