@@ -198,7 +198,7 @@ config = {
         "store_mode":            "store"
     },
     "training": {
-        "batch_size":       1,
+        "batch_size":       2,
         "num_epochs":       30,
         "warm_up_epochs":   3,
         "start_val_epoch":  5,
