@@ -25,7 +25,7 @@ from model.model import AdaSpot
 def get_args():
     #Basic arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='SoccerNetBall')
+    parser.add_argument('--model_name', type=str, default='soccernetball')
     parser.add_argument('--seed', type=int, default=1)
     return parser.parse_args()
 
