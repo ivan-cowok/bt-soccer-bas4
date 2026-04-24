@@ -163,7 +163,7 @@ def main():
                         help='Full video resolution (no scale). Overrides default hr_dim from config.')
     parser.add_argument('--ffmpeg', default=None,
                         help='Path to ffmpeg.exe (optional; auto-detected if omitted)')
-    parser.add_argument('--config', type=str, default=None,
+    parser.add_argument('--config', type=str, default='soccernetball/soccernetball.json',
                         help='AdaSpot JSON (reads model.hr_dim). Default: MyLeague/MyLeague_finetune.json')
     parser.add_argument('--hr_dim', type=int, nargs=2, metavar=('H', 'W'), default=None,
                         help='Resize to H x W (model hr_dim order). Overrides --config.')
