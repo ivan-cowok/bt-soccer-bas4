@@ -205,7 +205,7 @@ config = {
         "learning_rate":    0.0002,
         "only_test":        False,
         "criterion":        "loss",
-        "num_workers":      0,
+        "num_workers":      8,
         "lowres_loss":      True,
         "highres_loss":     True,
         "freeze_backbone_epochs": 5,

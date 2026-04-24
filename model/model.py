@@ -305,9 +305,13 @@ class AdaSpot(BaseRGBModel):
             return x / 255.
         
         def augment(self, x):
-            for i in range(x.shape[0]):
-                x[i] = self.augmentation(x[i])
-            return x
+            # ColorJitter (hue) on large CUDA tensors allocates huge temporaries; run augment on CPU
+            # then copy back so the rest of the forward stays on GPU.
+            device = x.device
+            x_cpu = x.contiguous().cpu()
+            for i in range(x_cpu.shape[0]):
+                x_cpu[i] = self.augmentation(x_cpu[i])
+            return x_cpu.to(device, non_blocking=True)
 
         def standarize(self, x):
             for i in range(x.shape[0]):
