@@ -71,11 +71,11 @@ def resolve_ffmpeg(explicit):
 
 VIDEO_ROOT  = Path(r"/workspace/44/data/soccer_data")
 FRAMES_ROOT = Path(r"/workspace/44/data/soccer_data_frames")
-DATA_DIR    = Path(r"/workspace/44/bt-soccer-bas4/data/my_league")
+DATA_DIR    = Path(r"/workspace/44/bt-soccer-bas4/data/soccernetball")
 
 #VIDEO_ROOT  = Path(r"E:/Database/44/soccer_data")
 #FRAMES_ROOT = Path(r"E:/Database/44/soccer_data_frames")
-#DATA_DIR    = Path(r"data/my_league")
+#DATA_DIR    = Path(r"data/soccernetball")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MY_LEAGUE_CONFIG = SCRIPT_DIR / 'config' / 'SoccerNetBall' / 'soccernetball.json'
