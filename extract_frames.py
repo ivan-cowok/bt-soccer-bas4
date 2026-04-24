@@ -78,7 +78,7 @@ DATA_DIR    = Path(r"/workspace/44/bt-soccer-bas4/data/soccernetball")
 #DATA_DIR    = Path(r"data/soccernetball")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MY_LEAGUE_CONFIG = SCRIPT_DIR / 'config' / 'SoccerNetBall' / 'soccernetball.json'
+DEFAULT_MY_LEAGUE_CONFIG = SCRIPT_DIR / 'config' / 'soccernetball' / 'soccernetball.json'
 FPS = 25
 
 
