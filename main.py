@@ -124,6 +124,11 @@ def main(args):
             )
         args.model.pretrained_backbone = False
 
+    print(
+        f'[backbone] feature_arch={args.model.feature_arch} '
+        f'pretrained_backbone={bool(getattr(args.model, "pretrained_backbone", False))}'
+    )
+
     # Check labels path for SN-BAS
     if args.data.dataset == 'soccernetball':
         if not os.path.exists(LABELS_SNB_PATH): # check that the path exists

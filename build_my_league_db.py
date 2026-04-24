@@ -205,11 +205,11 @@ config = {
         "learning_rate":    0.0002,
         "only_test":        False,
         "criterion":        "loss",
-        "classification_loss": "bce_yolo",
+        "classification_loss": "ce",
         "num_workers":      4,
         "lowres_loss":      True,
         "highres_loss":     True,
-        "freeze_backbone_epochs": 5,
+        "freeze_backbone_epochs": 2,
         "skip_empty_clips": True
     },
     "model": {
@@ -220,7 +220,7 @@ config = {
         "lr_dim":             [224, 398],
         "lr_crop":            [224, 398],
         "roi_size":           [112, 112],
-        "feature_arch":       "rny004_gsf",
+        "feature_arch":       "rny008_gsf",
         "blocks_temporal":    [True, True, True, True],
         "aggregation":        "max",
         "temporal_arch":      "gru",
@@ -231,8 +231,9 @@ config = {
         "roi_size_step":      28,
         "use_full_hr":        True,
         "use_cbam":           True,
-        "pretrained":         False,
-        "init_checkpoint":    "config/pretrained/SoccernetBall_Big/checkpoint_best.pt"
+        "pretrained":         True,
+        "pretrained_backbone": True,
+        #"init_checkpoint":    "config/pretrained/SoccernetBall_Big/checkpoint_best.pt"
     }
 }
 cfg_path = os.path.join(CFG_OUT_DIR, 'soccernetball.json')

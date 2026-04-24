@@ -31,7 +31,7 @@ from util.io import load_json, store_json_inference
 
 def get_args():
     p = argparse.ArgumentParser(description="Visualize SoccerNet Ball action spotting on a video")
-    p.add_argument("--video", type=str, default='D:/Data/1.mp4', help="Input video path")
+    p.add_argument("--video", type=str, default='D:/Data/15.mp4', help="Input video path")
     p.add_argument(
         "--output",
         type=str,
@@ -41,12 +41,12 @@ def get_args():
     p.add_argument(
         "--checkpoint",
         type=str,
-        default='checkpoints/Soccernetball/SoccerNetBall-1/checkpoint_epoch_0012.pt',
+        default='checkpoints/Soccernetball/SoccerNetBall-1/checkpoint_epoch_0029.pt',
         help="Path to checkpoint_best.pt or a folder containing it (default: config/pretrained/SoccernetBall_Big)",
     )
     p.add_argument("--model_name", type=str, default="Soccernetball", help="Config name under config/<Dataset>/")
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--inference_threshold", type=float, default=0.3)
+    p.add_argument("--inference_threshold", type=float, default=0.1)
     p.add_argument("--batch_size", type=int, default=4, help="Lower if GPU runs out of memory")
     p.add_argument(
         "--save-json",
@@ -333,8 +333,24 @@ def main():
     config_path = args.model_name.split("_")[0] + "/" + args.model_name + ".json"
     config = load_json(os.path.join("config", config_path))
     args_ns = update_args(argparse.Namespace(model_name=args.model_name, seed=args.seed), config)
-    # Full weights come from checkpoint; skip Hugging Face ImageNet download (works offline / behind firewalls).
-    args_ns.model.pretrained_backbone = False
+
+    # Initialize backbone from HF/timm ImageNet weights as a safety net before loading
+    # the full AdaSpot checkpoint. Any tensors missing/shape-mismatched in the checkpoint
+    # keep ImageNet values instead of being random. Honors offline env vars.
+    if "pretrained_backbone" in config["model"]:
+        args_ns.model.pretrained_backbone = bool(config["model"]["pretrained_backbone"])
+    else:
+        args_ns.model.pretrained_backbone = True
+    _offline = os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true", "yes") or \
+        os.environ.get("TRANSFORMERS_OFFLINE", "").lower() in ("1", "true", "yes")
+    if _offline:
+        if getattr(args_ns.model, "pretrained_backbone", False):
+            print("Warning: HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE is set; forcing pretrained_backbone=False.")
+        args_ns.model.pretrained_backbone = False
+    print(
+        f"[backbone] feature_arch={args_ns.model.feature_arch} "
+        f"pretrained_backbone={bool(getattr(args_ns.model, 'pretrained_backbone', False))}"
+    )
 
     ckpt_path = resolve_checkpoint(args.checkpoint)
     active = getattr(args_ns.data, "active_class_names", None)

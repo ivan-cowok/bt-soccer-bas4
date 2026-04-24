@@ -60,14 +60,33 @@ class CustomRegNetY(nn.Module):
     def __init__(self, feature_arch='rny002', pretrained=True):
         super().__init__()
 
-        base = create_model({
-                    'rny002': 'regnety_002',
-                    'rny004': 'regnety_004',
-                    'rny006': 'regnety_006',
-                    'rny008': 'regnety_008',
-                }[feature_arch.rsplit('_', 1)[0]], pretrained=pretrained)
+        timm_name = {
+            'rny002': 'regnety_002',
+            'rny004': 'regnety_004',
+            'rny006': 'regnety_006',
+            'rny008': 'regnety_008',
+        }[feature_arch.rsplit('_', 1)[0]]
 
-        # Keep reference to original blocks
+        print(
+            f"[CustomRegNetY] feature_arch={feature_arch} -> timm '{timm_name}' "
+            f"pretrained={bool(pretrained)} "
+            f"({'HF/ImageNet weights' if pretrained else 'random init'})"
+        )
+
+        base = create_model(timm_name, pretrained=pretrained)
+
+        if pretrained:
+            with torch.no_grad():
+                try:
+                    w = base.stem.conv.weight.detach()
+                    print(
+                        f"[CustomRegNetY] backbone stem.conv weight stats: "
+                        f"mean={w.mean().item():.6f} std={w.std().item():.6f} "
+                        f"shape={tuple(w.shape)} -> pretrained weights LOADED"
+                    )
+                except Exception as e:
+                    print(f"[CustomRegNetY] could not read stem stats: {e!r}")
+
         self.stem = base.stem
         self.s1 = base.s1
         self.s2 = base.s2

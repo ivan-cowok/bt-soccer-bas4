@@ -55,7 +55,24 @@ def main(args):
     config_path = args.model_name.split('_')[0] + '/' + args.model_name + '.json'
     config = load_json(os.path.join('config', config_path))
     args = update_args(args, config)
-    args.model.pretrained_backbone = False  # weights loaded from checkpoint; no HF/timm ImageNet download
+
+    # Initialize backbone from HF/timm ImageNet weights as a safety net before loading
+    # the full AdaSpot checkpoint. Any keys missing or shape-mismatched in the checkpoint
+    # then keep their pretrained ImageNet values instead of being random.
+    if 'pretrained_backbone' in config['model']:
+        args.model.pretrained_backbone = bool(config['model']['pretrained_backbone'])
+    else:
+        args.model.pretrained_backbone = True
+    _offline = os.environ.get('HF_HUB_OFFLINE', '').lower() in ('1', 'true', 'yes') or \
+        os.environ.get('TRANSFORMERS_OFFLINE', '').lower() in ('1', 'true', 'yes')
+    if _offline:
+        if getattr(args.model, 'pretrained_backbone', False):
+            print('Warning: HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE is set; forcing pretrained_backbone=False.')
+        args.model.pretrained_backbone = False
+    print(
+        f'[backbone] feature_arch={args.model.feature_arch} '
+        f'pretrained_backbone={bool(getattr(args.model, "pretrained_backbone", False))}'
+    )
 
     # Get classes and elements (optional data.active_class_names: subset of class.txt)
     active = getattr(args.data, 'active_class_names', None)
