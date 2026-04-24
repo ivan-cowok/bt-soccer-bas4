@@ -305,12 +305,8 @@ class AdaSpot(BaseRGBModel):
             return x / 255.
         
         def augment(self, x):
-            # Hue jitter on GPU needs huge temporaries; run it on CPU instead. Do one batch index at a
-            # time so we never mirror the full (B,T,C,H,W) tensor in RAM (whole-batch .cpu() can OOM-kill).
-            device = x.device
             for i in range(x.shape[0]):
-                c = x[i].contiguous().cpu()
-                x[i] = self.augmentation(c).to(device, non_blocking=True)
+                x[i] = self.augmentation(x[i])
             return x
 
         def standarize(self, x):
