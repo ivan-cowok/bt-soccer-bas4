@@ -212,8 +212,10 @@ config = {
         "skip_empty_clips": True
     },
     "model": {
-        "hr_dim":             [448, 796],
-        "hr_crop":            [448, 796],
+        #"hr_dim":             [448, 796],
+        #"hr_crop":            [448, 796],
+        "hr_dim":             [360, 640],
+        "hr_crop":            [360, 640],
         "lr_dim":             [224, 398],
         "lr_crop":            [224, 398],
         "roi_size":           [112, 112],
