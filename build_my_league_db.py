@@ -205,6 +205,7 @@ config = {
         "learning_rate":    0.0002,
         "only_test":        False,
         "criterion":        "loss",
+        "classification_loss": "bce_yolo",
         "num_workers":      4,
         "lowres_loss":      True,
         "highres_loss":     True,

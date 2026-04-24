@@ -31,7 +31,7 @@ from util.io import load_json, store_json_inference
 
 def get_args():
     p = argparse.ArgumentParser(description="Visualize SoccerNet Ball action spotting on a video")
-    p.add_argument("--video", type=str, default='D:/Data/3.mp4', help="Input video path")
+    p.add_argument("--video", type=str, default='D:/Data/1.mp4', help="Input video path")
     p.add_argument(
         "--output",
         type=str,
@@ -41,12 +41,12 @@ def get_args():
     p.add_argument(
         "--checkpoint",
         type=str,
-        default='D:/work/44/AdaSpot-main/checkpoints/Soccernetball/SoccerNetBall-1/checkpoint_epoch_0005.pt',
+        default='checkpoints/Soccernetball/SoccerNetBall-1/checkpoint_epoch_0012.pt',
         help="Path to checkpoint_best.pt or a folder containing it (default: config/pretrained/SoccernetBall_Big)",
     )
     p.add_argument("--model_name", type=str, default="Soccernetball", help="Config name under config/<Dataset>/")
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--inference_threshold", type=float, default=0.1)
+    p.add_argument("--inference_threshold", type=float, default=0.3)
     p.add_argument("--batch_size", type=int, default=4, help="Lower if GPU runs out of memory")
     p.add_argument(
         "--save-json",

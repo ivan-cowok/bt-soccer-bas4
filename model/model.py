@@ -77,7 +77,8 @@ class AdaSpot(BaseRGBModel):
                 if args.dataset == 'f3set':
                     self._pred_fine = MultFCLayers(self.d * 2, F3SET_ELEMENTS)
                 else:
-                    self._pred_fine = FCLayers(self.d * 2, args.num_classes+1)
+                    _pdim = getattr(args, 'pred_num_classes', args.num_classes + 1)
+                    self._pred_fine = FCLayers(self.d * 2, _pdim)
 
                 # Separate heads for high-res and low-res (auxiliar supervision)
                 if self.highres_loss:
@@ -85,13 +86,15 @@ class AdaSpot(BaseRGBModel):
                     if args.dataset == 'f3set':
                         self._pred_fine_highres = MultFCLayers(self.d * 2, F3SET_ELEMENTS)
                     else:
-                        self._pred_fine_highres = FCLayers(self.d * 2, args.num_classes+1)
+                        _pdim = getattr(args, 'pred_num_classes', args.num_classes + 1)
+                        self._pred_fine_highres = FCLayers(self.d * 2, _pdim)
                 if self.lowres_loss:
                     self._temp_fine_lowres = nn.GRU(input_size=self.d, hidden_size=self.d, num_layers=1, batch_first=True, bidirectional=True)
                     if args.dataset == 'f3set':
                         self._pred_fine_lowres = MultFCLayers(self.d * 2, F3SET_ELEMENTS)
                     else:
-                        self._pred_fine_lowres = FCLayers(self.d * 2, args.num_classes+1)
+                        _pdim = getattr(args, 'pred_num_classes', args.num_classes + 1)
+                        self._pred_fine_lowres = FCLayers(self.d * 2, _pdim)
             
             else:
                 raise NotImplementedError(self._temp_arch)
@@ -345,6 +348,22 @@ class AdaSpot(BaseRGBModel):
         self.device = device
         args_model.lowres_loss = args_training.lowres_loss
         args_model.highres_loss = args_training.highres_loss
+
+        cl = getattr(args_training, 'classification_loss', 'ce').lower()
+        if cl not in ('ce', 'bce', 'bce_yolo'):
+            raise ValueError(
+                "training.classification_loss must be 'ce', 'bce', or 'bce_yolo'"
+            )
+        if args_model.dataset == 'f3set' and cl == 'bce_yolo':
+            raise ValueError("classification_loss 'bce_yolo' is only for non-f3set datasets")
+        self._classification_loss = cl
+
+        if args_model.dataset != 'f3set':
+            if cl == 'bce_yolo':
+                args_model.pred_num_classes = args_model.num_classes
+            else:
+                args_model.pred_num_classes = args_model.num_classes + 1
+
         self._model = AdaSpot.Impl(args=args_model)
         self._model.print_stats()
         self._dataset = args_model.dataset
@@ -352,6 +371,9 @@ class AdaSpot(BaseRGBModel):
         self._model.to(device)
 
         self._num_classes = args_model.num_classes + 1
+        self._num_logits = getattr(
+            args_model, 'pred_num_classes', args_model.num_classes + 1
+        )
 
         self._classes = classes
         self._elements = elements
@@ -371,6 +393,48 @@ class AdaSpot(BaseRGBModel):
 
     def clean_modules(self):
         self._model.clean_modules()
+
+    def _multiclass_classification_loss(self, logits, label, ce_kwargs, fg_weight):
+        """Non-f3set head: logits (N, C'); label (N,) class index 0..N_fg or (N, N_fg+1) soft (mixup)."""
+        c_full = self._num_classes
+        if self._classification_loss == 'bce_yolo':
+            n_fg = logits.shape[-1]
+            if label.dim() == 1:
+                tgt = torch.zeros(
+                    label.shape[0], n_fg, device=logits.device, dtype=logits.dtype
+                )
+                fg = label > 0
+                if fg.any():
+                    tgt[fg, label[fg].long() - 1] = 1.0
+            else:
+                tgt = label[:, 1:].to(logits.dtype)
+            pos_weight = None
+            if fg_weight != 1:
+                pos_weight = torch.tensor(
+                    [float(fg_weight)] * n_fg,
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+            per = F.binary_cross_entropy_with_logits(
+                logits, tgt, pos_weight=pos_weight, reduction='none'
+            )
+            return per.sum(dim=1).mean()
+        if self._classification_loss == 'bce':
+            if label.dim() == 1:
+                tgt = F.one_hot(label.long(), num_classes=c_full).to(logits.dtype)
+            else:
+                tgt = label.to(logits.dtype)
+            pos_weight = None
+            if fg_weight != 1:
+                pos_weight = torch.tensor(
+                    [1.0] + [float(fg_weight)] * (c_full - 1),
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+            per = F.binary_cross_entropy_with_logits(
+                logits, tgt, pos_weight=pos_weight, reduction='none')
+            return per.sum(dim=1).mean()
+        return F.cross_entropy(logits, label, **ce_kwargs)
 
     def epoch(self, loader, optimizer=None, scaler=None, lr_scheduler=None,
             fg_weight=5):
@@ -488,10 +552,9 @@ class AdaSpot(BaseRGBModel):
 
                     # Other dataset losses
                     else:
-                        predictions = pred.reshape(-1, self._num_classes)
-                        loss_final = F.cross_entropy(
-                            predictions, label,
-                            **ce_kwargs)
+                        predictions = pred.reshape(-1, self._num_logits)
+                        loss_final = self._multiclass_classification_loss(
+                            predictions, label, ce_kwargs, fg_weight)
                     
                     # High-res loss
                     if self._model.highres_loss:
@@ -522,10 +585,9 @@ class AdaSpot(BaseRGBModel):
                                 loss_highres += loss_cat
 
                         else:
-                            predictions_highres = pred_highres.reshape(-1, self._num_classes)
-                            loss_highres = F.cross_entropy(
-                                predictions_highres, label,
-                                **ce_kwargs)
+                            predictions_highres = pred_highres.reshape(-1, self._num_logits)
+                            loss_highres = self._multiclass_classification_loss(
+                                predictions_highres, label, ce_kwargs, fg_weight)
                     
                     # Low-res loss
                     if self._model.lowres_loss:
@@ -555,10 +617,9 @@ class AdaSpot(BaseRGBModel):
                                     pred_cat, label_cat, reduction='sum') / (label_action.shape[0] * label_action.shape[1])
                                 loss_lowres += loss_cat
                         else:
-                            predictions_lowres = pred_lowres.reshape(-1, self._num_classes)
-                            loss_lowres = F.cross_entropy(
-                                predictions_lowres, label,
-                                **ce_kwargs)
+                            predictions_lowres = pred_lowres.reshape(-1, self._num_logits)
+                            loss_lowres = self._multiclass_classification_loss(
+                                predictions_lowres, label, ce_kwargs, fg_weight)
                     
                     if self._model.highres_loss & self._model.lowres_loss:
                         loss += (loss_final + loss_highres + loss_lowres) / 3
@@ -600,8 +661,16 @@ class AdaSpot(BaseRGBModel):
                 )
                 return pred_cls.cpu().float().numpy(), pred.cpu().float().numpy()
             
-            pred = torch.softmax(pred, axis=2)
-            pred_cls = torch.argmax(pred, axis=2)
+            if self._classification_loss == 'bce_yolo':
+                # YOLO-style: sigmoid per class, background = 1 - max class prob (implicit).
+                cls_prob = torch.sigmoid(pred)
+                bg = (1.0 - cls_prob.max(dim=2, keepdim=True).values).clamp(min=0.0)
+                pred = torch.cat([bg, cls_prob], dim=2)
+            elif self._classification_loss == 'bce':
+                pred = torch.sigmoid(pred)
+            else:
+                pred = torch.softmax(pred, dim=2)
+            pred_cls = torch.argmax(pred, dim=2)
             return pred_cls.cpu().float().numpy(), pred.cpu().float().numpy()
 
     def process_multiple_heads_prediction(self, pred):
