@@ -15,6 +15,12 @@ Example:
 import argparse
 import os
 import sys
+import subprocess
+# Disable HF "Xet" download backend (native lib causes 0xC0000005 on Windows
+# when timm fetches pretrained weights). Must be set before huggingface_hub
+# is imported anywhere downstream.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import cv2
 import numpy as np
@@ -108,6 +114,40 @@ def resolve_checkpoint(checkpoint_arg):
     raise FileNotFoundError(
         f"Could not find checkpoint_best.pt under: {checkpoint_arg}"
     )
+
+def _can_load_timm_pretrained_backbone(feature_arch):
+    base_arch = str(feature_arch).rsplit('_', 1)[0]
+    timm_name = {
+        'rny002': 'regnety_002',
+        'rny004': 'regnety_004',
+        'rny006': 'regnety_006',
+        'rny008': 'regnety_008',
+    }.get(base_arch, None)
+    if timm_name is None:
+        return True
+    code = (
+        "import timm; "
+        f"timm.create_model('{timm_name}', pretrained=True); "
+        "print('ok')"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, '-c', code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        print(f"[backbone] pretrained probe failed with exception: {exc!r}")
+        return False
+    if proc.returncode != 0:
+        print(
+            "[backbone] pretrained timm probe failed "
+            f"(returncode={proc.returncode}); forcing pretrained_backbone=False."
+        )
+        return False
+    return True
 
 
 def class_colors(classes):
@@ -341,12 +381,24 @@ def main():
         args_ns.model.pretrained_backbone = bool(config["model"]["pretrained_backbone"])
     else:
         args_ns.model.pretrained_backbone = True
+    bb_path = getattr(args_ns.model, "pretrained_backbone_path", None)
+    if bb_path:
+        if not os.path.isabs(bb_path):
+            bb_path = os.path.join(os.getcwd(), bb_path)
+        args_ns.model.pretrained_backbone_path = bb_path
+        if not os.path.exists(bb_path):
+            raise FileNotFoundError(
+                f"model.pretrained_backbone_path does not exist: {bb_path}"
+            )
     _offline = os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true", "yes") or \
         os.environ.get("TRANSFORMERS_OFFLINE", "").lower() in ("1", "true", "yes")
     if _offline:
         if getattr(args_ns.model, "pretrained_backbone", False):
             print("Warning: HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE is set; forcing pretrained_backbone=False.")
         args_ns.model.pretrained_backbone = False
+    elif getattr(args_ns.model, "pretrained_backbone", False) and not bb_path:
+        if not _can_load_timm_pretrained_backbone(args_ns.model.feature_arch):
+            args_ns.model.pretrained_backbone = False
     print(
         f"[backbone] feature_arch={args_ns.model.feature_arch} "
         f"pretrained_backbone={bool(getattr(args_ns.model, 'pretrained_backbone', False))}"
@@ -379,7 +431,25 @@ def main():
         elements=None,
     )
     state = torch.load(ckpt_path, map_location=device)
-    model.load(state)
+    # strict=False so checkpoints trained with a different softic config
+    # (which adds/removes ``softic_proj.*`` keys) still load. Anything
+    # actually-required will show up in the report below.
+    _tgt_keys = set(model.state_dict().keys())
+    _src_keys = set(state.keys())
+    _missing = _tgt_keys - _src_keys
+    _unexpected = _src_keys - _tgt_keys
+    model.load(state, strict=False)
+    if _missing or _unexpected:
+        print(
+            f"[load] checkpoint partial load: missing={len(_missing)}, "
+            f"unexpected={len(_unexpected)}"
+        )
+        if _missing:
+            print("  missing keys (sample):",
+                  ", ".join(sorted(_missing)[:6]))
+        if _unexpected:
+            print("  unexpected keys (sample):",
+                  ", ".join(sorted(_unexpected)[:6]))
     model.clean_modules()
 
     stride = STRIDE_SNB

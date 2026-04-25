@@ -6,6 +6,14 @@ File containing the main training script for T-DEED.
 # Standard imports (do not force HF_HUB_OFFLINE here: it breaks timm ImageNet
 # weights unless they are already cached; set HF_HUB_OFFLINE=1 yourself if needed.)
 import os
+import sys
+import subprocess
+# The Hugging Face "Xet" download backend (hf_xet) ships a native library that
+# causes a Windows access violation (0xC0000005) on this environment when timm
+# tries to download pretrained backbone weights. Disable Xet *before* anything
+# else imports huggingface_hub, falling back to the legacy HTTP download path.
+os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
+os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
 import torch
 import numpy as np
 import random
@@ -92,6 +100,51 @@ _current_epoch = 0
 def worker_init_fn(worker_id):
     random.seed(worker_id + _current_epoch * 100)
 
+def _can_load_timm_pretrained_backbone(feature_arch):
+    """Preflight-check timm pretrained backbone loading in a child process.
+
+    Some Windows environments hard-crash (0xC0000005) when timm/HF tries to
+    resolve pretrained weights. Running this in-process would kill training, so
+    we probe in a subprocess and fall back safely on failure.
+    """
+    base_arch = str(feature_arch).rsplit('_', 1)[0]
+    timm_name = {
+        'rny002': 'regnety_002',
+        'rny004': 'regnety_004',
+        'rny006': 'regnety_006',
+        'rny008': 'regnety_008',
+    }.get(base_arch, None)
+    if timm_name is None:
+        return True
+
+    code = (
+        "import timm; "
+        f"timm.create_model('{timm_name}', pretrained=True); "
+        "print('ok')"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, '-c', code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        print(f'[backbone] pretrained probe failed with exception: {exc!r}')
+        return False
+    if proc.returncode != 0:
+        print(
+            '[backbone] pretrained timm probe failed '
+            f'(returncode={proc.returncode}). '
+            'Falling back to pretrained_backbone=False to avoid crash.'
+        )
+        if proc.stderr:
+            print('[backbone] probe stderr (tail):')
+            print('\n'.join(proc.stderr.splitlines()[-6:]))
+        return False
+    return True
+
 def main(args):
     
     #Set seed
@@ -116,6 +169,16 @@ def main(args):
             'Add "pretrained_backbone": true under "model" to enable timm/HF backbone weights.'
         )
 
+    bb_path = getattr(args.model, 'pretrained_backbone_path', None)
+    if bb_path:
+        if not os.path.isabs(bb_path):
+            bb_path = os.path.join(os.getcwd(), bb_path)
+        args.model.pretrained_backbone_path = bb_path
+        if not os.path.exists(bb_path):
+            raise FileNotFoundError(
+                f'model.pretrained_backbone_path does not exist: {bb_path}'
+            )
+
     _offline = os.environ.get('HF_HUB_OFFLINE', '').lower() in ('1', 'true', 'yes') or \
         os.environ.get('TRANSFORMERS_OFFLINE', '').lower() in ('1', 'true', 'yes')
     if _offline:
@@ -124,6 +187,10 @@ def main(args):
                 'Warning: HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE is set; forcing pretrained_backbone=False.'
             )
         args.model.pretrained_backbone = False
+    elif getattr(args.model, 'pretrained_backbone', False) and not bb_path:
+        # Guard against native crashes while loading timm pretrained weights.
+        if not _can_load_timm_pretrained_backbone(args.model.feature_arch):
+            args.model.pretrained_backbone = False
 
     print(
         f'[backbone] feature_arch={args.model.feature_arch} '
@@ -152,6 +219,15 @@ def main(args):
 
     # PyTorch: prefetch_factor only valid when num_workers > 0
     nw = args.training.num_workers
+    # Windows + debugger + multiprocessing workers can crash with native
+    # access violations (0xC0000005). Fall back to single-process loading
+    # for stable debug sessions.
+    if os.name == 'nt' and sys.gettrace() is not None and nw > 0:
+        print(
+            f'[dataloader] Debugger detected on Windows; forcing '
+            f'num_workers=0 (was {nw}) to avoid multiprocessing crashes.'
+        )
+        nw = 0
     prefetch = 1 if nw > 0 else None
 
     # Dataloaders

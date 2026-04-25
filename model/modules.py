@@ -57,7 +57,7 @@ class BaseRGBModel(ABCModel):
             self._model.load_state_dict(state_dict, strict=strict)
 
 class CustomRegNetY(nn.Module):
-    def __init__(self, feature_arch='rny002', pretrained=True):
+    def __init__(self, feature_arch='rny002', pretrained=True, pretrained_path=None):
         super().__init__()
 
         timm_name = {
@@ -67,15 +67,19 @@ class CustomRegNetY(nn.Module):
             'rny008': 'regnety_008',
         }[feature_arch.rsplit('_', 1)[0]]
 
+        source = 'HF/ImageNet weights' if pretrained else 'random init'
+        if pretrained_path is not None:
+            source = f'local backbone checkpoint: {pretrained_path}'
         print(
             f"[CustomRegNetY] feature_arch={feature_arch} -> timm '{timm_name}' "
-            f"pretrained={bool(pretrained)} "
-            f"({'HF/ImageNet weights' if pretrained else 'random init'})"
+            f"pretrained={bool(pretrained)} ({source})"
         )
 
-        base = create_model(timm_name, pretrained=pretrained)
+        # When a local backbone checkpoint path is provided, avoid HF/timm
+        # pretrained download and load the local file explicitly below.
+        base = create_model(timm_name, pretrained=(pretrained and pretrained_path is None))
 
-        if pretrained:
+        if pretrained and pretrained_path is None:
             with torch.no_grad():
                 try:
                     w = base.stem.conv.weight.detach()
@@ -86,6 +90,46 @@ class CustomRegNetY(nn.Module):
                     )
                 except Exception as e:
                     print(f"[CustomRegNetY] could not read stem stats: {e!r}")
+
+        if pretrained_path is not None:
+            state = torch.load(pretrained_path, map_location='cpu')
+            if isinstance(state, dict) and 'state_dict' in state:
+                state = state['state_dict']
+            if not isinstance(state, dict):
+                raise ValueError(
+                    f"[CustomRegNetY] invalid backbone checkpoint at {pretrained_path!r}"
+                )
+            # Strip common wrappers.
+            cleaned = {}
+            for k, v in state.items():
+                nk = k
+                if nk.startswith('module.'):
+                    nk = nk[len('module.'):]
+                if nk.startswith('model.'):
+                    nk = nk[len('model.'):]
+                if nk.startswith('backbone.'):
+                    nk = nk[len('backbone.'):]
+                if nk.startswith('lowres_backbone.'):
+                    nk = nk[len('lowres_backbone.'):]
+                if nk.startswith('_model.lowres_backbone.'):
+                    nk = nk[len('_model.lowres_backbone.'):]
+                cleaned[nk] = v
+
+            missing, unexpected = base.load_state_dict(cleaned, strict=False)
+            print(
+                f"[CustomRegNetY] loaded local backbone weights: "
+                f"missing={len(missing)} unexpected={len(unexpected)}"
+            )
+            with torch.no_grad():
+                try:
+                    w = base.stem.conv.weight.detach()
+                    print(
+                        f"[CustomRegNetY] local stem.conv weight stats: "
+                        f"mean={w.mean().item():.6f} std={w.std().item():.6f} "
+                        f"shape={tuple(w.shape)} -> local pretrained weights LOADED"
+                    )
+                except Exception as e:
+                    print(f"[CustomRegNetY] could not read local stem stats: {e!r}")
 
         self.stem = base.stem
         self.s1 = base.s1

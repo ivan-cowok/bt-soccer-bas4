@@ -1,6 +1,13 @@
 #Global imports
 import argparse
 import os
+import sys
+import subprocess
+# Disable HF "Xet" download backend (native lib causes 0xC0000005 on Windows
+# when timm fetches pretrained weights). Must be set before huggingface_hub
+# is imported anywhere downstream.
+os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
+os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -49,6 +56,40 @@ def update_args(args, config):
 
     return args
 
+def _can_load_timm_pretrained_backbone(feature_arch):
+    base_arch = str(feature_arch).rsplit('_', 1)[0]
+    timm_name = {
+        'rny002': 'regnety_002',
+        'rny004': 'regnety_004',
+        'rny006': 'regnety_006',
+        'rny008': 'regnety_008',
+    }.get(base_arch, None)
+    if timm_name is None:
+        return True
+    code = (
+        "import timm; "
+        f"timm.create_model('{timm_name}', pretrained=True); "
+        "print('ok')"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, '-c', code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        print(f'[backbone] pretrained probe failed with exception: {exc!r}')
+        return False
+    if proc.returncode != 0:
+        print(
+            '[backbone] pretrained timm probe failed '
+            f'(returncode={proc.returncode}); forcing pretrained_backbone=False.'
+        )
+        return False
+    return True
+
 
 def main(args):
 
@@ -63,12 +104,24 @@ def main(args):
         args.model.pretrained_backbone = bool(config['model']['pretrained_backbone'])
     else:
         args.model.pretrained_backbone = True
+    bb_path = getattr(args.model, 'pretrained_backbone_path', None)
+    if bb_path:
+        if not os.path.isabs(bb_path):
+            bb_path = os.path.join(os.getcwd(), bb_path)
+        args.model.pretrained_backbone_path = bb_path
+        if not os.path.exists(bb_path):
+            raise FileNotFoundError(
+                f'model.pretrained_backbone_path does not exist: {bb_path}'
+            )
     _offline = os.environ.get('HF_HUB_OFFLINE', '').lower() in ('1', 'true', 'yes') or \
         os.environ.get('TRANSFORMERS_OFFLINE', '').lower() in ('1', 'true', 'yes')
     if _offline:
         if getattr(args.model, 'pretrained_backbone', False):
             print('Warning: HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE is set; forcing pretrained_backbone=False.')
         args.model.pretrained_backbone = False
+    elif getattr(args.model, 'pretrained_backbone', False) and not bb_path:
+        if not _can_load_timm_pretrained_backbone(args.model.feature_arch):
+            args.model.pretrained_backbone = False
     print(
         f'[backbone] feature_arch={args.model.feature_arch} '
         f'pretrained_backbone={bool(getattr(args.model, "pretrained_backbone", False))}'
@@ -99,8 +152,29 @@ def main(args):
     model = AdaSpot(args_model=args.model, args_training=args.training, classes=classes, elements=elements)
 
     print('START INFERENCE')
-    model.load(torch.load(os.path.join(
-        os.getcwd(), args.paths.save_dir, 'checkpoint_epoch_0005.pt')))
+    # Use strict=False so a checkpoint trained with a different softic
+    # configuration (e.g. softic_proj.* present/absent) still loads. Any
+    # actually-required tensors that are missing will be obvious from the
+    # printed report.
+    _ckpt = torch.load(os.path.join(
+        os.getcwd(), args.paths.save_dir, 'checkpoint_epoch_0005.pt'),
+        map_location='cpu')
+    _tgt_keys = set(model.state_dict().keys())
+    _src_keys = set(_ckpt.keys())
+    _missing = _tgt_keys - _src_keys
+    _unexpected = _src_keys - _tgt_keys
+    model.load(_ckpt, strict=False)
+    if _missing or _unexpected:
+        print(
+            f'[load] checkpoint partial load: missing={len(_missing)}, '
+            f'unexpected={len(_unexpected)}'
+        )
+        if _missing:
+            print('  missing keys (sample):',
+                  ', '.join(sorted(_missing)[:6]))
+        if _unexpected:
+            print('  unexpected keys (sample):',
+                  ', '.join(sorted(_unexpected)[:6]))
     model.clean_modules() # clean modules to remove unnecessary parameters for inference and speed up evaluation
 
     stride = STRIDE

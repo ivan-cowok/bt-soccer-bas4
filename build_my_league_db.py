@@ -216,7 +216,10 @@ config = {
         "sam_rho": 2.0,
         "softic": False,
         "softic_lambda": 0.001,
-        "softic_temperature": 0.1
+        "softic_temperature": 0.1,
+        "softic_feat_dim": 128,
+        "softic_bank_size": 256,
+        "softic_warmup_size": 32
     },
 
     "model": {

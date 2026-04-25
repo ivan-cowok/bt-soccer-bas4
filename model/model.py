@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from model.modules import BaseRGBModel, CustomRegNetY, FCLayers, MultFCLayers, ROISelector
 from model.shift import make_temporal_shift, make_astrm
 from model.impl.sam import disable_bn_running_stats, enable_bn_running_stats
-from model.impl.softic import soft_ic_loss
+from model.impl.softic import ProjectionHead, SoftICLoss
 from util.constants import F3SET_ELEMENTS
 
 
@@ -40,8 +40,13 @@ class AdaSpot(BaseRGBModel):
             # Get main backbones (low-res and high-res) --> high-res a copy of low-res identical
             # pretrained_backbone=False avoids timm/HF ImageNet download when loading a full checkpoint after.
             _pretrained = getattr(args, 'pretrained_backbone', True)
+            _pretrained_path = getattr(args, 'pretrained_backbone_path', None)
             if self._feature_arch.startswith(('rny002', 'rny004', 'rny006', 'rny008')):
-                backbone = CustomRegNetY(self._feature_arch, pretrained=_pretrained)
+                backbone = CustomRegNetY(
+                    self._feature_arch,
+                    pretrained=_pretrained,
+                    pretrained_path=_pretrained_path,
+                )
                 self.d = backbone.ds[-1]
                 backbone.head.fc = nn.Identity()
             else:
@@ -117,6 +122,51 @@ class AdaSpot(BaseRGBModel):
             
             else:
                 raise NotImplementedError(self._temp_arch)
+
+            # ----------------------------------------------------------- #
+            # Soft-IC contrastive head + memory-bank loss module.
+            # The projection head maps post-GRU embeddings (B, T, d*2)
+            # to a low-dim feature space (default 128, paper). The bank
+            # state is owned by ``self.softic_loss`` so it travels with
+            # ``.to(device)`` automatically. Both are created only when
+            # Soft-IC is enabled and the dataset supports a single C-dim
+            # soft label (i.e. not f3set).
+            # ----------------------------------------------------------- #
+            self._softic_enabled = bool(getattr(args, 'softic', False)) \
+                and args.dataset != 'f3set'
+            if self._softic_enabled:
+                _sic_feat_dim = int(getattr(args, 'softic_feat_dim', 128))
+                _sic_bank_size = int(getattr(args, 'softic_bank_size', 256))
+                _sic_temp = float(getattr(args, 'softic_temperature', 0.1))
+                _sic_warmup = int(getattr(args, 'softic_warmup_size', 32))
+                # ``_sic_num_classes`` is the C the loss/bank operate over.
+                # For 'bce_yolo' we drop the implicit-background channel so
+                # the contrastive label space matches the classifier head.
+                _cl = getattr(args, 'classification_loss', 'ce')
+                if _cl == 'bce_yolo':
+                    _sic_num_classes = int(args.num_classes)
+                else:
+                    _sic_num_classes = int(args.num_classes) + 1
+                self.softic_proj = ProjectionHead(
+                    in_dim=self.d * 2,
+                    out_dim=_sic_feat_dim,
+                )
+                self.softic_loss = SoftICLoss(
+                    num_classes=_sic_num_classes,
+                    feat_dim=_sic_feat_dim,
+                    bank_size=_sic_bank_size,
+                    temperature=_sic_temp,
+                    warmup_size=_sic_warmup,
+                )
+                print(
+                    f'[Soft-IC] head={self.d * 2}->{self.softic_proj.hidden_dim}'
+                    f'->{_sic_feat_dim} | bank={_sic_bank_size} '
+                    f'| C={_sic_num_classes} | tau={_sic_temp} '
+                    f'| warmup={_sic_warmup}'
+                )
+            else:
+                self.softic_proj = None
+                self.softic_loss = None
             
             #HR and LR resizing
             self.resizing_hr = T.Resize((args.hr_dim[0], args.hr_dim[1]))
@@ -277,6 +327,11 @@ class AdaSpot(BaseRGBModel):
             output_dict = {}
             output_dict['im_feat'] = im_feat
             output_dict['embedding'] = embedding
+            # Soft-IC projection: only built when softic is enabled. The
+            # head produces L2-normalized 128-D features used downstream
+            # by AdaSpot._compute_loss + self.softic_loss.
+            if self.softic_proj is not None:
+                output_dict['embedding_proj'] = self.softic_proj(embedding)
             if self.highres_loss & self.do_auxiliar_supervision:
                 output_dict['im_feat_highres'] = im_feat_highres
             if self.lowres_loss & self.do_auxiliar_supervision:
@@ -373,6 +428,14 @@ class AdaSpot(BaseRGBModel):
                 del self._modules['_pred_fine_lowres']
             if '_pred_displ_lowres' in modules:
                 del self._modules['_pred_displ_lowres']
+            # Soft-IC modules are training-only.
+            if 'softic_proj' in modules:
+                del self._modules['softic_proj']
+                self.softic_proj = None
+            if 'softic_loss' in modules:
+                del self._modules['softic_loss']
+                self.softic_loss = None
+            self._softic_enabled = False
             self.do_auxiliar_supervision = False
             print('Eliminated auxiliary supervision modules not required for inference.')
 
@@ -404,17 +467,34 @@ class AdaSpot(BaseRGBModel):
         self._softic_temperature = float(
             getattr(args_training, 'softic_temperature', 0.1)
         )
+        self._softic_feat_dim = int(
+            getattr(args_training, 'softic_feat_dim', 128))
+        self._softic_bank_size = int(
+            getattr(args_training, 'softic_bank_size', 256))
+        self._softic_warmup_size = int(
+            getattr(args_training, 'softic_warmup_size', 32))
         if self._softic and args_model.dataset == 'f3set':
             raise ValueError(
                 "training.softic=True is not supported for the f3set dataset; "
                 "its multi-element label space does not map to a single soft "
                 "label distribution. Set softic=false in the config."
             )
+        # Propagate Soft-IC + classification-loss config to the inner Impl,
+        # which builds the projection head + memory-bank module from these.
+        args_model.softic = self._softic
+        args_model.softic_feat_dim = self._softic_feat_dim
+        args_model.softic_bank_size = self._softic_bank_size
+        args_model.softic_temperature = self._softic_temperature
+        args_model.softic_warmup_size = self._softic_warmup_size
+        args_model.classification_loss = cl
         if self._softic:
             print(
                 f'[loss] Soft-IC enabled '
                 f'(lambda={self._softic_lambda}, '
-                f'temperature={self._softic_temperature})'
+                f'temperature={self._softic_temperature}, '
+                f'feat_dim={self._softic_feat_dim}, '
+                f'bank_size={self._softic_bank_size}, '
+                f'warmup={self._softic_warmup_size})'
             )
 
         self._model = AdaSpot.Impl(args=args_model)
@@ -489,11 +569,18 @@ class AdaSpot(BaseRGBModel):
             return per.sum(dim=1).mean()
         return F.cross_entropy(logits, label, **ce_kwargs)
 
-    def _compute_loss(self, frame, label, labelE, ce_kwargs, fg_weight, inference):
+    def _compute_loss(self, frame, label, labelE, ce_kwargs, fg_weight,
+                      inference, enqueue_softic='now'):
         """Forward pass + total loss for one (already-mixup-prepared) batch.
 
         Used both by the standard training step and by the SAM/ASAM second
         forward pass. `labelE` is None for non-f3set datasets.
+
+        Args:
+            enqueue_softic: one of 'now', 'pending', or False (see
+                ``SoftICLoss.forward`` docstring). 'now' is correct for
+                vanilla SGD; 'pending' for the first SAM pass; False for
+                the second SAM pass and for validation.
         """
         with torch.autocast("cuda", dtype=torch.bfloat16):
             output = self._model(frame, inference=inference)
@@ -619,13 +706,16 @@ class AdaSpot(BaseRGBModel):
             # Skipped when lambda is 0 to avoid the cost of the contrastive
             # similarity matrix on a zero-weighted term.
             if (self._softic and self._dataset != 'f3set'
-                    and self._softic_lambda > 0):
-                embedding = output['embedding']             # (B, T, d*2)
-                feat = embedding.reshape(-1, embedding.shape[-1])
+                    and self._softic_lambda > 0
+                    and self._model.softic_loss is not None):
+                # Use the projection-head output (L2-normalized 128-D feats).
+                proj = output['embedding_proj']             # (B, T, feat_dim)
+                feat = proj.reshape(-1, proj.shape[-1])
 
                 # Build per-instance soft labels in the same C-dim space the
-                # classifier uses. self._num_classes already includes the
-                # background channel (= num_fg + 1).
+                # contrastive loss / memory bank operate over. The bank's C
+                # was set in Impl.__init__ to match the classifier's logits:
+                # num_classes+1 for ce/bce, num_classes for bce_yolo.
                 if label.dim() == 1:
                     soft = F.one_hot(
                         label.long(), num_classes=self._num_classes
@@ -635,14 +725,14 @@ class AdaSpot(BaseRGBModel):
 
                 if self._classification_loss == 'bce_yolo':
                     # YOLO-style head omits an explicit background channel;
-                    # for Soft-IC we drop it too so the contrastive label
-                    # space matches the classifier's output space.
+                    # drop it so the contrastive label space matches the
+                    # classifier's output space (and the bank's C).
                     soft = soft[:, 1:]
 
-                l_sic = soft_ic_loss(
-                    feat, soft, temperature=self._softic_temperature
+                l_sic = self._model.softic_loss(
+                    feat, soft, enqueue=enqueue_softic
                 )
-                # soft_ic_loss returns fp32 by design (numeric stability);
+                # SoftICLoss returns fp32 by design (numeric stability);
                 # cast to the dtype of `loss` so the autocast graph stays
                 # consistent and `.backward()` sees a single-dtype scalar.
                 loss = loss + (
@@ -741,8 +831,22 @@ class AdaSpot(BaseRGBModel):
 
                 labelE_arg = labelE if self._dataset == 'f3set' else None
 
+                # First (or only) forward.
+                # Soft-IC bank policy:
+                #   - validation        -> False (don't pollute bank)
+                #   - vanilla training  -> 'now'   (enqueue right after loss)
+                #   - SAM training      -> 'pending' (defer; flushed AFTER
+                #     the second pass so the second pass's anchors never see
+                #     their own features in the bank)
+                if optimizer is None:
+                    _enq_first = False
+                elif sam is not None:
+                    _enq_first = 'pending'
+                else:
+                    _enq_first = 'now'
                 loss = self._compute_loss(
-                    frame, label, labelE_arg, ce_kwargs, fg_weight, inference)
+                    frame, label, labelE_arg, ce_kwargs, fg_weight, inference,
+                    enqueue_softic=_enq_first)
 
                 if optimizer is not None:
                     # Scale the per-micro-batch loss so that the accumulated
@@ -773,16 +877,28 @@ class AdaSpot(BaseRGBModel):
 
                         # 3) Second pass at perturbed weights, with BN running
                         #    stats frozen so the running stats don't drift.
+                        #    enqueue_softic=False: the bank must be unchanged
+                        #    between first and second passes so the second
+                        #    pass's anchors don't see their own (clean-pass)
+                        #    features as positives. The pending stash from
+                        #    pass 1 is flushed AFTER both passes complete.
                         disable_bn_running_stats(self._model)
                         loss2 = self._compute_loss(
                             frame, label, labelE_arg, ce_kwargs, fg_weight,
-                            inference)
+                            inference, enqueue_softic=False)
                         (loss2 / N_accum).backward()
 
                         # 4) Restore weights, but DO NOT step yet - we need
                         #    to accumulate the sharp gradient first.
                         sam.second_step(zero_grad=False, do_step=False)
                         enable_bn_running_stats(self._model)
+
+                        # 4b) Flush the stashed first-pass features into the
+                        #     Soft-IC memory bank now that both forward passes
+                        #     are done.
+                        if (self._softic
+                                and self._model.softic_loss is not None):
+                            self._model.softic_loss.flush_pending()
 
                         # 5) Add this micro-batch's sharp grad to the
                         #    accumulator, then clear p.grad so the next

@@ -1,7 +1,7 @@
 {
   "paths": {
-    "frame_dir": "E:/Database/44/soccer_data_frames",
-    "save_dir": "D:\\work\\44\\AdaSpot-main\\checkpoints\\soccernetball"
+    "frame_dir": "/workspace/44/data/soccer_data_frames",
+    "save_dir": "/workspace/44/bt-soccer-bas4/checkpoints/soccernetball"
   },
   "data": {
     "dataset": "soccernetball",
@@ -14,18 +14,28 @@
     "store_mode": "store"
   },
   "training": {
-    "batch_size": 1,
-    "num_epochs": 30,
+    "batch_size": 2,
+    "grad_accum_steps": 4,
+    "num_epochs": 40,
     "warm_up_epochs": 3,
     "start_val_epoch": 5,
     "learning_rate": 0.0002,
     "only_test": false,
     "criterion": "loss",
-    "num_workers": 0,
+    "classification_loss": "ce",
+    "num_workers": 4,
     "lowres_loss": true,
     "highres_loss": true,
-    "freeze_backbone_epochs": 5,
-    "skip_empty_clips": true
+    "freeze_backbone_epochs": 3,
+    "skip_empty_clips": false,
+    "sam": "asam",
+    "sam_rho": 2.0,
+    "softic": false,
+    "softic_lambda": 0.001,
+    "softic_temperature": 0.1,
+    "softic_feat_dim": 128,
+    "softic_bank_size": 256,
+    "softic_warmup_size": 32
   },
   "model": {
     "hr_dim": [
@@ -49,6 +59,8 @@
       112
     ],
     "feature_arch": "rny004_gsf",
+    "astrm_reduction": 4,
+    "astrm_kernel_size": 3,
     "blocks_temporal": [
       true,
       true,
@@ -64,7 +76,8 @@
     "roi_size_step": 28,
     "use_full_hr": true,
     "use_cbam": true,
-    "pretrained": false,
-    "init_checkpoint": "config/pretrained/SoccernetBall_Big/checkpoint_best.pt"
+    "pretrained": true,
+    "pretrained_backbone": true,
+    "init_checkpoint":    "config/pretrained/SoccernetBall_Big/checkpoint_best.pt"
   }
 }
