@@ -1,4 +1,4 @@
-"""
+r"""
 Soft Instance Contrastive (Soft-IC) loss with projection head + memory bank.
 
 Faithful re-implementation of the formulation in:
