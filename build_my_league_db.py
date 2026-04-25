@@ -228,7 +228,7 @@ config = {
         "lr_crop":            [224, 398],
         "roi_size":           [112, 112],
 
-        "feature_arch": "rny008_astrm",
+        "feature_arch": "rny004_astrm",
         "astrm_reduction": 4,
         "astrm_kernel_size": 3,
 
