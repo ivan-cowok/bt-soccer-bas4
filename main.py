@@ -21,6 +21,7 @@ from dataset.frame import ActionSpotVideoDataset
 from util.constants import LABELS_SNB_PATH, STRIDE, STRIDE_SNB, EVAL_SPLITS
 from util.eval import evaluate, evaluate_SNB
 from model.model import AdaSpot
+from model.impl.sam import build_sam
 
 def get_args():
     #Basic arguments
@@ -189,11 +190,57 @@ def main(args):
     # Optimizer and scaler
     optimizer, scaler = model.get_optimizer({'lr': args.training.learning_rate})
 
+    # Optional SAM / ASAM wrapper (no-op when training.sam is 'none' or absent).
+    # ASAM is recommended for small datasets with class imbalance; it doubles
+    # the per-step compute (two forward+backward passes).
+    sam_mode = str(getattr(args.training, 'sam', 'none')).lower()
+    sam_rho = float(getattr(args.training, 'sam_rho', 0.5))
+    sam = build_sam(model._get_params(), optimizer, mode=sam_mode, rho=sam_rho)
+    if sam is not None:
+        adaptive_str = 'ASAM' if sam_mode == 'asam' else 'SAM'
+        print(
+            f'[optim] {adaptive_str} enabled (rho={sam_rho}). '
+            f'Each training step now performs 2 forward+backward passes.'
+        )
+    else:
+        print('[optim] SAM/ASAM disabled (training.sam == "none").')
+
+    # Gradient accumulation: simulate a larger effective batch on a single
+    # GPU. ``effective_batch = batch_size * grad_accum_steps``. The LR
+    # scheduler must count *optimizer* steps, not micro-batches, so we
+    # divide ``len(train_loader)`` by the accumulation count below.
+    grad_accum_steps = max(1, int(getattr(args.training, 'grad_accum_steps', 1)))
+    if grad_accum_steps > 1:
+        eff_batch = args.training.batch_size * grad_accum_steps
+        print(
+            f'[optim] Gradient accumulation enabled: '
+            f'micro_batch={args.training.batch_size} x '
+            f'grad_accum_steps={grad_accum_steps} '
+            f'-> effective batch size = {eff_batch}'
+        )
+        if sam is not None:
+            print(
+                '[optim] Note: with SAM/ASAM + grad accum, each micro-batch '
+                'still does its own first/second pass (per-micro-batch '
+                'perturbation); the sharp gradient is averaged across '
+                f'{grad_accum_steps} micro-batches before the optimizer step.'
+            )
+    else:
+        print('[optim] Gradient accumulation disabled (grad_accum_steps=1).')
+
     # Training loop
     if not args.training.only_test:
-        
-        # Warmup schedule
-        num_steps_per_epoch = len(train_loader)
+
+        # Warmup schedule. ``num_steps_per_epoch`` is the number of
+        # *optimizer* steps per epoch, which is what the LR scheduler
+        # ticks on. With grad accum, that is fewer than the number of
+        # micro-batches in the loader. Use ceiling division so the
+        # residual step at the end of each epoch (when len(loader) is
+        # not divisible by grad_accum_steps) is also accounted for.
+        num_steps_per_epoch = max(
+            1,
+            (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps,
+        )
         num_epochs, lr_scheduler = get_lr_scheduler(
             args.training, optimizer, num_steps_per_epoch)
         
@@ -227,7 +274,8 @@ def main(args):
             # Train epoch
             time_train0 = time.time()
             train_loss = model.epoch(
-                train_loader, optimizer, scaler, lr_scheduler=lr_scheduler)
+                train_loader, optimizer, scaler, lr_scheduler=lr_scheduler,
+                sam=sam, grad_accum_steps=grad_accum_steps)
             time_train1 = time.time()
             time_train = time_train1 - time_train0
             

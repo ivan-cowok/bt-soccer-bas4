@@ -198,20 +198,27 @@ config = {
         "store_mode":            "store"
     },
     "training": {
-        "batch_size":       2,
-        "num_epochs":       30,
-        "warm_up_epochs":   3,
-        "start_val_epoch":  5,
-        "learning_rate":    0.0002,
-        "only_test":        False,
-        "criterion":        "loss",
+        "batch_size": 2,
+        "grad_accum_steps": 4,
+        "num_epochs": 40,
+        "warm_up_epochs": 3,
+        "start_val_epoch": 5,
+        "learning_rate": 0.0002,
+        "only_test": False,
+        "criterion": "loss",
         "classification_loss": "ce",
-        "num_workers":      4,
-        "lowres_loss":      True,
-        "highres_loss":     True,
-        "freeze_backbone_epochs": 2,
-        "skip_empty_clips": True
+        "num_workers": 4,
+        "lowres_loss": True,
+        "highres_loss": True,
+        "freeze_backbone_epochs": 3,
+        "skip_empty_clips": False,
+        "sam": "none",
+        "sam_rho": 2.0,
+        "softic": False,
+        "softic_lambda": 0.001,
+        "softic_temperature": 0.1
     },
+
     "model": {
         "hr_dim":             [448, 796],
         "hr_crop":            [448, 796],
@@ -220,7 +227,11 @@ config = {
         "lr_dim":             [224, 398],
         "lr_crop":            [224, 398],
         "roi_size":           [112, 112],
-        "feature_arch":       "rny008_gsf",
+
+        "feature_arch": "rny008_astrm",
+        "astrm_reduction": 4,
+        "astrm_kernel_size": 3,
+
         "blocks_temporal":    [True, True, True, True],
         "aggregation":        "max",
         "temporal_arch":      "gru",

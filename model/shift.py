@@ -12,6 +12,7 @@ import math
 #Local imports
 from model.impl.gsm import _GSM
 from model.impl.gsf import _GSF
+from model.impl.astrm import ASTRM
 from model.modules import CustomRegNetY
 
 
@@ -81,3 +82,80 @@ class GatedShift(nn.Module):
         y[:, :self.fold_dim, :, :] = self.gs(x[:, :self.fold_dim, :, :])
         y[:, self.fold_dim:, :, :] = x[:, self.fold_dim:, :, :]
         return self.net(y)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Spatio-Temporal Refinement Module (ASTRM) integration.
+#
+# Unlike GSM/GSF (which gate-shift channels BEFORE the bottleneck's conv1),
+# the paper inserts ASTRM AFTER conv1, on the conv1 output features. We
+# therefore wrap conv1 into a small module that runs the original conv1
+# first, then ASTRM on its output, before returning to the rest of the
+# bottleneck (conv2, SE, conv3, residual add).
+# ---------------------------------------------------------------------------
+class ASTRMWrapper(nn.Module):
+    def __init__(self, conv1, n_segment, reduction=4, kernel_size=3):
+        super().__init__()
+        out_ch = self._get_out_channels(conv1)
+        self.net = conv1
+        self.astrm = ASTRM(
+            channels=out_ch,
+            n_segment=n_segment,
+            reduction=reduction,
+            kernel_size=kernel_size,
+        )
+        self.n_segment = n_segment
+        self.out_channels = out_ch
+        print(
+            f'=> Using ASTRM, channels: {out_ch}, T: {n_segment}, '
+            f'reduction: {reduction}, kernel_size: {kernel_size}'
+        )
+
+    @staticmethod
+    def _get_out_channels(net):
+        if isinstance(net, timm.layers.conv_bn_act.ConvBnAct):
+            return net.conv.out_channels
+        if isinstance(net, nn.Conv2d):
+            return net.out_channels
+        if hasattr(net, 'out_channels'):
+            return net.out_channels
+        # Fallback: walk children for any Conv2d.
+        for m in reversed(list(net.modules())):
+            if isinstance(m, nn.Conv2d):
+                return m.out_channels
+        raise NotImplementedError(type(net))
+
+    def forward(self, x):
+        x = self.net(x)
+        return self.astrm(x)
+
+
+def make_astrm(net, clip_len, blocks_temporal=None, reduction=4, kernel_size=3):
+    """Insert ASTRM after conv1 in each selected RegNetY bottleneck."""
+    if not isinstance(net, CustomRegNetY):
+        raise NotImplementedError(
+            'ASTRM currently only supports CustomRegNetY backbones'
+        )
+
+    if blocks_temporal is None:
+        blocks_temporal = [False, False, True, True]
+
+    def make_stage_astrm(stage):
+        blocks = list(stage.children())
+        print('=> ASTRM: processing stage with {} blocks'.format(len(blocks)))
+        for i, b in enumerate(blocks):
+            blocks[i].conv1 = ASTRMWrapper(
+                b.conv1,
+                n_segment=clip_len,
+                reduction=reduction,
+                kernel_size=kernel_size,
+            )
+
+    if blocks_temporal[0]:
+        make_stage_astrm(net.s1)
+    if blocks_temporal[1]:
+        make_stage_astrm(net.s2)
+    if blocks_temporal[2]:
+        make_stage_astrm(net.s3)
+    if blocks_temporal[3]:
+        make_stage_astrm(net.s4)

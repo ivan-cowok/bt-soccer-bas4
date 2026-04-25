@@ -9,8 +9,10 @@ import random
 from torch.nn import functional as F
 
 # Local imports
-from model.modules import BaseRGBModel, CustomRegNetY, FCLayers, MultFCLayers, ROISelector, step
-from model.shift import make_temporal_shift
+from model.modules import BaseRGBModel, CustomRegNetY, FCLayers, MultFCLayers, ROISelector
+from model.shift import make_temporal_shift, make_astrm
+from model.impl.sam import disable_bn_running_stats, enable_bn_running_stats
+from model.impl.softic import soft_ic_loss
 from util.constants import F3SET_ELEMENTS
 
 
@@ -49,6 +51,23 @@ class AdaSpot(BaseRGBModel):
                 make_temporal_shift(backbone, args.clip_len, mode='gsm', blocks_temporal = args.blocks_temporal)
             elif self._feature_arch.endswith('_gsf'):
                 make_temporal_shift(backbone, args.clip_len, mode='gsf', blocks_temporal = args.blocks_temporal)
+            elif self._feature_arch.endswith('_astrm'):
+                # ASTRM is a self-contained spatio-temporal refinement; no
+                # GSM/GSF channel-shifting is applied alongside it.
+                astrm_red = int(getattr(args, 'astrm_reduction', 4))
+                astrm_k = int(getattr(args, 'astrm_kernel_size', 3))
+                make_astrm(
+                    backbone,
+                    args.clip_len,
+                    blocks_temporal=args.blocks_temporal,
+                    reduction=astrm_red,
+                    kernel_size=astrm_k,
+                )
+                print(
+                    f'[backbone] ASTRM enabled '
+                    f'(reduction={astrm_red}, kernel_size={astrm_k}, '
+                    f'blocks_temporal={args.blocks_temporal})'
+                )
 
             self.lowres_backbone = backbone
             # Adapt padding convolutions backbone
@@ -135,8 +154,18 @@ class AdaSpot(BaseRGBModel):
                     std=[1/s for s in (0.229, 0.224, 0.225)]) #Imagenet mean and std
             ])
 
-            # RoI Selector module
-            self.roi_selector = ROISelector(roi_size = args.roi_size, threshold = args.threshold, original_size = (args.hr_crop[0], args.hr_crop[1]))
+            # RoI Selector module. ``roi_spatial_increase`` and
+            # ``roi_size_step`` come from the config when present; the
+            # defaults match the previous hard-coded behaviour.
+            _roi_inc = int(getattr(args, 'roi_spatial_increase', 8))
+            _roi_step = int(getattr(args, 'roi_size_step', 28))
+            self.roi_selector = ROISelector(
+                roi_size=args.roi_size,
+                spatial_increase=_roi_inc,
+                threshold=args.threshold,
+                original_size=(args.hr_crop[0], args.hr_crop[1]),
+                size_step=_roi_step,
+            )
             
             self.do_auxiliar_supervision = True # Set to true as default (to false when preparing model just for inference)
 
@@ -240,10 +269,14 @@ class AdaSpot(BaseRGBModel):
 
             # Temporal module and prediction head
             im_feat = self._temp_fine(im_feat)[0]
+            # Save pre-FC, post-GRU per-frame embedding for contrastive losses
+            # (e.g. Soft-IC). Shape: (B, T, d*2). Cheap pass-through.
+            embedding = im_feat
             im_feat = self._pred_fine(im_feat)
 
             output_dict = {}
             output_dict['im_feat'] = im_feat
+            output_dict['embedding'] = embedding
             if self.highres_loss & self.do_auxiliar_supervision:
                 output_dict['im_feat_highres'] = im_feat_highres
             if self.lowres_loss & self.do_auxiliar_supervision:
@@ -364,6 +397,26 @@ class AdaSpot(BaseRGBModel):
             else:
                 args_model.pred_num_classes = args_model.num_classes + 1
 
+        # Soft-IC (Soft Instance Contrastive) loss config.
+        # Total objective when enabled: L_final = L_classification + lambda * L_SIC.
+        self._softic = bool(getattr(args_training, 'softic', False))
+        self._softic_lambda = float(getattr(args_training, 'softic_lambda', 1.0))
+        self._softic_temperature = float(
+            getattr(args_training, 'softic_temperature', 0.1)
+        )
+        if self._softic and args_model.dataset == 'f3set':
+            raise ValueError(
+                "training.softic=True is not supported for the f3set dataset; "
+                "its multi-element label space does not map to a single soft "
+                "label distribution. Set softic=false in the config."
+            )
+        if self._softic:
+            print(
+                f'[loss] Soft-IC enabled '
+                f'(lambda={self._softic_lambda}, '
+                f'temperature={self._softic_temperature})'
+            )
+
         self._model = AdaSpot.Impl(args=args_model)
         self._model.print_stats()
         self._dataset = args_model.dataset
@@ -436,8 +489,181 @@ class AdaSpot(BaseRGBModel):
             return per.sum(dim=1).mean()
         return F.cross_entropy(logits, label, **ce_kwargs)
 
+    def _compute_loss(self, frame, label, labelE, ce_kwargs, fg_weight, inference):
+        """Forward pass + total loss for one (already-mixup-prepared) batch.
+
+        Used both by the standard training step and by the SAM/ASAM second
+        forward pass. `labelE` is None for non-f3set datasets.
+        """
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output = self._model(frame, inference=inference)
+
+            pred = output['im_feat']
+            if self._model.highres_loss:
+                pred_highres = output['im_feat_highres']
+
+            if self._model.lowres_loss:
+                pred_lowres = output['im_feat_lowres']
+
+            loss = 0.
+
+            # Final loss: F3Set vs other datasets
+            if self._dataset == 'f3set':
+                pred_action = pred[0].squeeze(-1)
+                if isinstance(labelE, list):
+                    label_action = labelE[0][:, :, 1]
+                else:
+                    label_action = labelE[:, 0]
+                loss_final = F.binary_cross_entropy_with_logits(
+                    pred_action, label_action,
+                    pos_weight=torch.tensor([fg_weight]).to(self.device)
+                )
+                for i in range(1, len(pred)):
+                    pred_cat = pred[i].reshape(-1, F3SET_ELEMENTS[i - 1])
+                    if isinstance(labelE, list):
+                        label_cat = labelE[i].reshape(-1, labelE[i].shape[-1])
+                        mask = label_cat.sum(dim=1) > 0
+                    else:
+                        label_cat = labelE[:, i].long().reshape(-1)
+                        mask = label_cat != -1
+                    pred_cat = pred_cat[mask]
+                    label_cat = label_cat[mask]
+                    if label_cat.numel() == 0:
+                        continue
+                    loss_cat = F.cross_entropy(
+                        pred_cat, label_cat, reduction='sum') / (
+                        label_action.shape[0] * label_action.shape[1])
+                    loss_final += loss_cat
+            else:
+                predictions = pred.reshape(-1, self._num_logits)
+                loss_final = self._multiclass_classification_loss(
+                    predictions, label, ce_kwargs, fg_weight)
+
+            # High-res auxiliary loss
+            if self._model.highres_loss:
+                if self._dataset == 'f3set':
+                    predictions_highres = pred_highres[0].squeeze(-1)
+                    if isinstance(labelE, list):
+                        label_action = labelE[0][:, :, 1]
+                    else:
+                        label_action = labelE[:, 0]
+                    loss_highres = F.binary_cross_entropy_with_logits(
+                        predictions_highres, label_action,
+                        pos_weight=torch.tensor([fg_weight]).to(self.device)
+                    )
+                    for i in range(1, len(pred_highres)):
+                        pred_cat = pred_highres[i].reshape(-1, F3SET_ELEMENTS[i - 1])
+                        if isinstance(labelE, list):
+                            label_cat = labelE[i].reshape(-1, labelE[i].shape[-1])
+                            mask = label_cat.sum(dim=1) > 0
+                        else:
+                            label_cat = labelE[:, i].long().reshape(-1)
+                            mask = label_cat != -1
+                        pred_cat = pred_cat[mask]
+                        label_cat = label_cat[mask]
+                        if label_cat.numel() == 0:
+                            continue
+                        loss_cat = F.cross_entropy(
+                            pred_cat, label_cat, reduction='sum') / (
+                            label_action.shape[0] * label_action.shape[1])
+                        loss_highres += loss_cat
+                else:
+                    predictions_highres = pred_highres.reshape(-1, self._num_logits)
+                    loss_highres = self._multiclass_classification_loss(
+                        predictions_highres, label, ce_kwargs, fg_weight)
+
+            # Low-res auxiliary loss
+            if self._model.lowres_loss:
+                if self._dataset == 'f3set':
+                    predictions_lowres = pred_lowres[0].squeeze(-1)
+                    if isinstance(labelE, list):
+                        label_action = labelE[0][:, :, 1]
+                    else:
+                        label_action = labelE[:, 0]
+                    loss_lowres = F.binary_cross_entropy_with_logits(
+                        predictions_lowres, label_action,
+                        pos_weight=torch.tensor([fg_weight]).to(self.device)
+                    )
+                    for i in range(1, len(pred_lowres)):
+                        pred_cat = pred_lowres[i].reshape(-1, F3SET_ELEMENTS[i - 1])
+                        if isinstance(labelE, list):
+                            label_cat = labelE[i].reshape(-1, labelE[i].shape[-1])
+                            mask = label_cat.sum(dim=1) > 0
+                        else:
+                            label_cat = labelE[:, i].long().reshape(-1)
+                            mask = label_cat != -1
+                        pred_cat = pred_cat[mask]
+                        label_cat = label_cat[mask]
+                        if label_cat.numel() == 0:
+                            continue
+                        loss_cat = F.cross_entropy(
+                            pred_cat, label_cat, reduction='sum') / (
+                            label_action.shape[0] * label_action.shape[1])
+                        loss_lowres += loss_cat
+                else:
+                    predictions_lowres = pred_lowres.reshape(-1, self._num_logits)
+                    loss_lowres = self._multiclass_classification_loss(
+                        predictions_lowres, label, ce_kwargs, fg_weight)
+
+            if self._model.highres_loss & self._model.lowres_loss:
+                loss += (loss_final + loss_highres + loss_lowres) / 3
+            elif self._model.highres_loss:
+                loss += (loss_final + loss_highres) / 2
+            elif self._model.lowres_loss:
+                loss += (loss_final + loss_lowres) / 2
+            else:
+                loss += loss_final
+
+            # Soft-IC: L_final(.) = L_classification + lambda_SIC * L_SIC.
+            # Only enabled for non-f3set; f3set is rejected at __init__ time.
+            # Skipped when lambda is 0 to avoid the cost of the contrastive
+            # similarity matrix on a zero-weighted term.
+            if (self._softic and self._dataset != 'f3set'
+                    and self._softic_lambda > 0):
+                embedding = output['embedding']             # (B, T, d*2)
+                feat = embedding.reshape(-1, embedding.shape[-1])
+
+                # Build per-instance soft labels in the same C-dim space the
+                # classifier uses. self._num_classes already includes the
+                # background channel (= num_fg + 1).
+                if label.dim() == 1:
+                    soft = F.one_hot(
+                        label.long(), num_classes=self._num_classes
+                    ).to(feat.dtype)
+                else:
+                    soft = label.to(feat.dtype)
+
+                if self._classification_loss == 'bce_yolo':
+                    # YOLO-style head omits an explicit background channel;
+                    # for Soft-IC we drop it too so the contrastive label
+                    # space matches the classifier's output space.
+                    soft = soft[:, 1:]
+
+                l_sic = soft_ic_loss(
+                    feat, soft, temperature=self._softic_temperature
+                )
+                # soft_ic_loss returns fp32 by design (numeric stability);
+                # cast to the dtype of `loss` so the autocast graph stays
+                # consistent and `.backward()` sees a single-dtype scalar.
+                loss = loss + (
+                    self._softic_lambda * l_sic
+                ).to(loss.dtype)
+
+        return loss
+
     def epoch(self, loader, optimizer=None, scaler=None, lr_scheduler=None,
-            fg_weight=5):
+            fg_weight=5, sam=None, grad_accum_steps=1):
+        """Run one epoch of training (if ``optimizer`` is given) or validation.
+
+        Args:
+            grad_accum_steps: number of micro-batches to accumulate before
+                stepping. ``effective_batch = micro_batch * grad_accum_steps``.
+                Combined with SAM, each micro-batch still does its own
+                first/second pass (per-micro-batch perturbation), but the
+                sharp gradient is accumulated across ``grad_accum_steps``
+                micro-batches before the optimizer step. This keeps memory
+                low while recovering the paper's effective batch size.
+        """
 
         if optimizer is None:
             inference = True
@@ -446,6 +672,12 @@ class AdaSpot(BaseRGBModel):
             inference = False
             optimizer.zero_grad()
             self._model.train()
+
+        N_accum = max(1, int(grad_accum_steps))
+
+        # Per-parameter buffer for the accumulated *sharp* gradient when
+        # SAM + grad accumulation are combined. Empty otherwise.
+        sam_accum = {}
 
         # Positive classes weights
         ce_kwargs = {}
@@ -507,134 +739,76 @@ class AdaSpot(BaseRGBModel):
                 label = label.flatten() if len(label.shape) == 2 \
                     else label.view(-1, label.shape[-1])
 
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    output = self._model(frame, inference=inference)
+                labelE_arg = labelE if self._dataset == 'f3set' else None
 
-                    pred = output['im_feat']
-                    if self._model.highres_loss:
-                        pred_highres = output['im_feat_highres']
-
-                    if self._model.lowres_loss:
-                        pred_lowres = output['im_feat_lowres']
-
-                    loss = 0.
-
-                    #F3Set loss - binary background/foregruand binary cross-entropy + per-category cross-entropy
-                    if self._dataset == 'f3set':
-                        # Loss action / background
-                        pred_action = pred[0].squeeze(-1)
-                        if isinstance(labelE, list):
-                            label_action = labelE[0][:, :, 1]
-                        else:
-                            label_action = labelE[:, 0]
-                        loss_final = F.binary_cross_entropy_with_logits(
-                            pred_action, label_action, pos_weight=torch.tensor([fg_weight]).to(self.device)
-                        )
-                        # Category losses
-                        for i in range(1, len(pred)):
-                            
-                            pred_cat = pred[i].reshape(-1, F3SET_ELEMENTS[i - 1])
-                            if isinstance(labelE, list):
-                                label_cat = labelE[i].reshape(-1, labelE[i].shape[-1])
-                                mask = label_cat.sum(dim=1) > 0
-                            else:
-                                label_cat = labelE[:, i].long().reshape(-1)
-                                mask = label_cat != -1
-                            pred_cat = pred_cat[mask]
-                            label_cat = label_cat[mask]
-                            if label_cat.numel() == 0:
-                                continue
-                            
-                            loss_cat = F.cross_entropy(
-                                pred_cat, label_cat, reduction='sum') / (label_action.shape[0] * label_action.shape[1])
-                            
-                            loss_final += loss_cat
-
-                    # Other dataset losses
-                    else:
-                        predictions = pred.reshape(-1, self._num_logits)
-                        loss_final = self._multiclass_classification_loss(
-                            predictions, label, ce_kwargs, fg_weight)
-                    
-                    # High-res loss
-                    if self._model.highres_loss:
-                        if self._dataset == 'f3set':
-                            predictions_highres = pred_highres[0].squeeze(-1)
-                            if isinstance(labelE, list):
-                                label_action = labelE[0][:, :, 1]
-                            else:
-                                label_action = labelE[:, 0]
-                            loss_highres = F.binary_cross_entropy_with_logits(
-                                predictions_highres, label_action, pos_weight=torch.tensor([fg_weight]).to(self.device)
-                            )
-                            # Category losses
-                            for i in range(1, len(pred_highres)):
-                                pred_cat = pred_highres[i].reshape(-1, F3SET_ELEMENTS[i - 1])
-                                if isinstance(labelE, list):
-                                    label_cat = labelE[i].reshape(-1, labelE[i].shape[-1])
-                                    mask = label_cat.sum(dim=1) > 0
-                                else:
-                                    label_cat = labelE[:, i].long().reshape(-1)
-                                    mask = label_cat != -1
-                                pred_cat = pred_cat[mask]
-                                label_cat = label_cat[mask]
-                                if label_cat.numel() == 0:
-                                    continue
-                                loss_cat = F.cross_entropy(
-                                    pred_cat, label_cat, reduction='sum') / (label_action.shape[0] * label_action.shape[1])
-                                loss_highres += loss_cat
-
-                        else:
-                            predictions_highres = pred_highres.reshape(-1, self._num_logits)
-                            loss_highres = self._multiclass_classification_loss(
-                                predictions_highres, label, ce_kwargs, fg_weight)
-                    
-                    # Low-res loss
-                    if self._model.lowres_loss:
-                        if self._dataset == 'f3set':
-                            predictions_lowres = pred_lowres[0].squeeze(-1)
-                            if isinstance(labelE, list):
-                                label_action = labelE[0][:, :, 1]
-                            else:
-                                label_action = labelE[:, 0]
-                            loss_lowres = F.binary_cross_entropy_with_logits(
-                                predictions_lowres, label_action, pos_weight=torch.tensor([fg_weight]).to(self.device)
-                            )
-                            # Category losses
-                            for i in range(1, len(pred_lowres)):
-                                pred_cat = pred_lowres[i].reshape(-1, F3SET_ELEMENTS[i - 1])
-                                if isinstance(labelE, list):
-                                    label_cat = labelE[i].reshape(-1, labelE[i].shape[-1])
-                                    mask = label_cat.sum(dim=1) > 0
-                                else:
-                                    label_cat = labelE[:, i].long().reshape(-1)
-                                    mask = label_cat != -1
-                                pred_cat = pred_cat[mask]
-                                label_cat = label_cat[mask]
-                                if label_cat.numel() == 0:
-                                    continue
-                                loss_cat = F.cross_entropy(
-                                    pred_cat, label_cat, reduction='sum') / (label_action.shape[0] * label_action.shape[1])
-                                loss_lowres += loss_cat
-                        else:
-                            predictions_lowres = pred_lowres.reshape(-1, self._num_logits)
-                            loss_lowres = self._multiclass_classification_loss(
-                                predictions_lowres, label, ce_kwargs, fg_weight)
-                    
-                    if self._model.highres_loss & self._model.lowres_loss:
-                        loss += (loss_final + loss_highres + loss_lowres) / 3
-                    
-                    elif self._model.highres_loss:
-                        loss += (loss_final + loss_highres) / 2
-
-                    elif self._model.lowres_loss:
-                        loss += (loss_final + loss_lowres) / 2
-                    else:
-                        loss += loss_final   
+                loss = self._compute_loss(
+                    frame, label, labelE_arg, ce_kwargs, fg_weight, inference)
 
                 if optimizer is not None:
-                    step(self._model, optimizer, scaler, loss,
-                        lr_scheduler=lr_scheduler)
+                    # Scale the per-micro-batch loss so that the accumulated
+                    # gradient equals the mean over the effective batch.
+                    micro_loss = loss / N_accum
+                    is_step_iter = ((batch_idx + 1) % N_accum == 0) or \
+                                   (batch_idx + 1 == len(loader))
+
+                    if sam is None:
+                        # Vanilla gradient accumulation: backward N times,
+                        # step once. p.grad accumulates naturally.
+                        micro_loss.backward()
+                        if is_step_iter:
+                            optimizer.step()
+                            optimizer.zero_grad()
+                            if lr_scheduler is not None:
+                                lr_scheduler.step()
+                    else:
+                        # SAM / ASAM with grad accumulation:
+                        # 1) First pass: backward to populate p.grad with
+                        #    THIS micro-batch's first-pass gradient (we zero'd
+                        #    it after the previous micro-batch's accum step).
+                        micro_loss.backward()
+
+                        # 2) Perturb based on this micro-batch's grad and
+                        #    clear it so the second backward starts fresh.
+                        sam.first_step(zero_grad=True)
+
+                        # 3) Second pass at perturbed weights, with BN running
+                        #    stats frozen so the running stats don't drift.
+                        disable_bn_running_stats(self._model)
+                        loss2 = self._compute_loss(
+                            frame, label, labelE_arg, ce_kwargs, fg_weight,
+                            inference)
+                        (loss2 / N_accum).backward()
+
+                        # 4) Restore weights, but DO NOT step yet - we need
+                        #    to accumulate the sharp gradient first.
+                        sam.second_step(zero_grad=False, do_step=False)
+                        enable_bn_running_stats(self._model)
+
+                        # 5) Add this micro-batch's sharp grad to the
+                        #    accumulator, then clear p.grad so the next
+                        #    micro-batch's first backward starts clean.
+                        for group in optimizer.param_groups:
+                            for p in group['params']:
+                                if p.grad is None:
+                                    continue
+                                if p in sam_accum:
+                                    sam_accum[p].add_(p.grad)
+                                else:
+                                    sam_accum[p] = p.grad.detach().clone()
+                        optimizer.zero_grad()
+
+                        # 6) Every N_accum micro-batches (or at epoch end),
+                        #    move accumulated grads back into p.grad and step.
+                        if is_step_iter:
+                            for group in optimizer.param_groups:
+                                for p in group['params']:
+                                    if p in sam_accum:
+                                        p.grad = sam_accum[p]
+                            optimizer.step()
+                            optimizer.zero_grad()
+                            sam_accum.clear()
+                            if lr_scheduler is not None:
+                                lr_scheduler.step()
 
                 epoch_loss += loss.detach().item()
 

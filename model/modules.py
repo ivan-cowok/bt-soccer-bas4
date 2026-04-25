@@ -156,14 +156,19 @@ class MultFCLayers(nn.Module):
         return outputs
 
 class ROISelector(nn.Module):
-    def __init__(self, roi_size = (112, 112), spatial_increase = 8, threshold = 0.3, original_size = (448, 448)):
+    def __init__(self, roi_size=(112, 112), spatial_increase=8, threshold=0.3,
+                 original_size=(448, 448), size_step=28):
         super().__init__()
         self.roi_size = roi_size
         self.spatial_increase = spatial_increase
         self.threshold = threshold
         self.original_size = original_size
-        
-        self.sizes = (np.arange(roi_size[0], original_size[0], 28), np.arange(roi_size[1], original_size[1], 28))
+        self.size_step = int(size_step)
+
+        self.sizes = (
+            np.arange(roi_size[0], original_size[0], self.size_step),
+            np.arange(roi_size[1], original_size[1], self.size_step),
+        )
     
     def forward(self, x):
         """
@@ -324,15 +329,16 @@ class ROISelector(nn.Module):
         return out
 
 def step(model, optimizer, scaler, loss, lr_scheduler=None):
-    scaler = None
+    """Single-batch optimizer step. Kept for external scripts that import it.
+
+    The main training loop in ``AdaSpot.epoch`` no longer uses this helper
+    (it manages its own SAM/ASAM and gradient-accumulation logic).
+    """
     if scaler is None:
         loss.backward()
-    else:
-        scaler.scale(loss).backward()
-
-    if scaler is None:
         optimizer.step()
     else:
+        scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
     if lr_scheduler is not None:
