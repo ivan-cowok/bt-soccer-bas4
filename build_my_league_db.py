@@ -212,7 +212,7 @@ config = {
         "highres_loss": True,
         "freeze_backbone_epochs": 3,
         "skip_empty_clips": False,
-        "sam": "none",
+        "sam": "asam",
         "sam_rho": 2.0,
         "softic": False,
         "softic_lambda": 0.001,
