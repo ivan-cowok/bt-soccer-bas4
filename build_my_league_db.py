@@ -231,7 +231,7 @@ config = {
         "lr_crop":            [224, 398],
         "roi_size":           [112, 112],
 
-        "feature_arch": "rny004_astrm",
+        "feature_arch": "rny004_gsf",
         "astrm_reduction": 4,
         "astrm_kernel_size": 3,
 
@@ -247,7 +247,7 @@ config = {
         "use_cbam":           True,
         "pretrained":         True,
         "pretrained_backbone": True,
-        #"init_checkpoint":    "config/pretrained/SoccernetBall_Big/checkpoint_best.pt"
+        "init_checkpoint":    "config/pretrained/SoccernetBall_Big/checkpoint_best.pt"
     }
 }
 cfg_path = os.path.join(CFG_OUT_DIR, 'soccernetball.json')
