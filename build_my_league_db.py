@@ -32,7 +32,7 @@ import json, os, random
 from collections import Counter
 
 # Per-epoch random-clip budgets (steps per epoch ~= value // clip_len; clip_len=100 in config below).
-EPOCH_NUM_FRAMES_TRAIN = 200000  # train e.g. 2000 steps if batch_size=1
+EPOCH_NUM_FRAMES_TRAIN = 300000  # train e.g. 2000 steps if batch_size=1
 EPOCH_NUM_FRAMES_VAL = 100000  # val e.g. 1000 steps; omit key in JSON to match train (see datasets.py)
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ config = {
     "training": {
         "batch_size": 2,
         "grad_accum_steps": 4,
-        "num_epochs": 40,
+        "num_epochs": 80,
         "warm_up_epochs": 3,
         "start_val_epoch": 5,
         "learning_rate": 0.0002,
