@@ -67,13 +67,13 @@ VAL_EPOCH_FRAMES = (
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-#LABELS_ROOT   = r'/workspace/44/data/soccer_data'
-LABELS_ROOT   = r'E:/Database/44/soccer_data'
+LABELS_ROOT   = r'/workspace/44/data/soccer_data'
+#LABELS_ROOT   = r'E:/Database/44/soccer_data'
 ADASPOT_ROOT  = os.path.dirname(os.path.abspath(__file__))
 DATA_OUT_DIR  = os.path.join(ADASPOT_ROOT, 'data', 'soccernetball')
 CFG_OUT_DIR   = os.path.join(ADASPOT_ROOT, 'config', 'soccernetball')
-#FRAME_DIR     = r'/workspace/44/data/soccer_data_frames'   # where frames will live
-FRAME_DIR     = r'E:/Database/44/soccer_data_frames'   # where frames will live
+FRAME_DIR     = r'/workspace/44/data/soccer_data_frames'   # where frames will live
+#FRAME_DIR     = r'E:/Database/44/soccer_data_frames'   # where frames will live
 SAVE_DIR      = os.path.join(ADASPOT_ROOT, 'checkpoints', 'soccernetball')
 
 FPS           = 25          # assumed frame rate for your clips
