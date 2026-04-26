@@ -84,17 +84,30 @@ class SoftICLoss(nn.Module):
         warmup_size:   minimum number of bank entries before the loss starts
                        contributing. Smaller -> the term turns on earlier
                        but with noisier statistics.
+        omega_min:     numerical-stability floor on the anchor's class-c soft
+                       mass ``w_{ic}`` (the divisor in eq. 10's per-pair
+                       prefactor). Without this floor, mixup tail draws
+                       (Beta(0.2, 0.2) puts ~13% of samples below 1e-3 and
+                       can produce values as small as 1e-22) cause the per-
+                       pair loss ``-weighted_sum / (omega * |M(c)|)`` to blow
+                       up by ``1/omega``. The paper does not combine mixup
+                       with Soft-IC, so this case is unspecified; a floor of
+                       0.1 caps the amplification at 10x and keeps the
+                       contrastive term within the same order of magnitude
+                       as the classification loss in mixup'd batches. Set
+                       to 0.0 to recover the strict paper formula.
         eps:           numerical-stability constant.
     """
 
     def __init__(self, num_classes, feat_dim=128, bank_size=256,
-                 temperature=0.1, warmup_size=32, eps=1e-8):
+                 temperature=0.1, warmup_size=32, omega_min=0.1, eps=1e-8):
         super().__init__()
         self.num_classes = int(num_classes)
         self.feat_dim = int(feat_dim)
         self.bank_size = int(bank_size)
         self.temperature = float(temperature)
         self.warmup_size = int(warmup_size)
+        self.omega_min = float(omega_min)
         self.eps = float(eps)
 
         # Bank lives in float32 -- the contrastive log-sum-exp is sensitive
@@ -284,8 +297,16 @@ class SoftICLoss(nn.Module):
             #   (n_a,)
 
             # Per-pair prefactor 1 / (omega * |M(c)|) from eq. (10), with
-            # omega = w_{ic} (anchor's class-c soft mass).
+            # omega = w_{ic} (anchor's class-c soft mass). Clamp to a small
+            # positive floor: mixup with Beta(0.2, 0.2) produces tail draws
+            # as small as 1e-20+, and the bare 1/omega divisor would blow
+            # the loss up by 1e9x on a single anchor. The paper never
+            # combines mixup with Soft-IC, so this case is unspecified;
+            # ``omega_min`` defaults to 0.1 (cap = 10x amplification) and
+            # can be set to 0.0 to recover the strict paper formula.
             omega = y[anchor_mask, c]                   # (n_a,)
+            if self.omega_min > 0.0:
+                omega = omega.clamp(min=self.omega_min)
             per_pair = -weighted_sum / (omega * float(n_pos) + self.eps)
 
             total_loss = total_loss + per_pair.sum()

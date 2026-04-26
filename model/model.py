@@ -139,6 +139,7 @@ class AdaSpot(BaseRGBModel):
                 _sic_bank_size = int(getattr(args, 'softic_bank_size', 256))
                 _sic_temp = float(getattr(args, 'softic_temperature', 0.1))
                 _sic_warmup = int(getattr(args, 'softic_warmup_size', 32))
+                _sic_omega_min = float(getattr(args, 'softic_omega_min', 0.1))
                 # ``_sic_num_classes`` is the C the loss/bank operate over.
                 # For 'bce_yolo' we drop the implicit-background channel so
                 # the contrastive label space matches the classifier head.
@@ -157,12 +158,13 @@ class AdaSpot(BaseRGBModel):
                     bank_size=_sic_bank_size,
                     temperature=_sic_temp,
                     warmup_size=_sic_warmup,
+                    omega_min=_sic_omega_min,
                 )
                 print(
                     f'[Soft-IC] head={self.d * 2}->{self.softic_proj.hidden_dim}'
                     f'->{_sic_feat_dim} | bank={_sic_bank_size} '
                     f'| C={_sic_num_classes} | tau={_sic_temp} '
-                    f'| warmup={_sic_warmup}'
+                    f'| warmup={_sic_warmup} | omega_min={_sic_omega_min}'
                 )
             else:
                 self.softic_proj = None
@@ -473,6 +475,8 @@ class AdaSpot(BaseRGBModel):
             getattr(args_training, 'softic_bank_size', 256))
         self._softic_warmup_size = int(
             getattr(args_training, 'softic_warmup_size', 32))
+        self._softic_omega_min = float(
+            getattr(args_training, 'softic_omega_min', 0.1))
         if self._softic and args_model.dataset == 'f3set':
             raise ValueError(
                 "training.softic=True is not supported for the f3set dataset; "
@@ -486,6 +490,7 @@ class AdaSpot(BaseRGBModel):
         args_model.softic_bank_size = self._softic_bank_size
         args_model.softic_temperature = self._softic_temperature
         args_model.softic_warmup_size = self._softic_warmup_size
+        args_model.softic_omega_min = self._softic_omega_min
         args_model.classification_loss = cl
         if self._softic:
             print(
@@ -494,7 +499,8 @@ class AdaSpot(BaseRGBModel):
                 f'temperature={self._softic_temperature}, '
                 f'feat_dim={self._softic_feat_dim}, '
                 f'bank_size={self._softic_bank_size}, '
-                f'warmup={self._softic_warmup_size})'
+                f'warmup={self._softic_warmup_size}, '
+                f'omega_min={self._softic_omega_min})'
             )
 
         self._model = AdaSpot.Impl(args=args_model)

@@ -37,7 +37,7 @@ from util.io import load_json, store_json_inference
 
 def get_args():
     p = argparse.ArgumentParser(description="Visualize SoccerNet Ball action spotting on a video")
-    p.add_argument("--video", type=str, default='D:/Data/15.mp4', help="Input video path")
+    p.add_argument("--video", type=str, default='D:/Data/23.mp4', help="Input video path")
     p.add_argument(
         "--output",
         type=str,
@@ -47,7 +47,7 @@ def get_args():
     p.add_argument(
         "--checkpoint",
         type=str,
-        default='checkpoints/Soccernetball/SoccerNetBall-1/checkpoint_epoch_0029.pt',
+        default='checkpoints/Soccernetball/SoccerNetBall-1/checkpoint_best.pt',
         help="Path to checkpoint_best.pt or a folder containing it (default: config/pretrained/SoccernetBall_Big)",
     )
     p.add_argument("--model_name", type=str, default="Soccernetball", help="Config name under config/<Dataset>/")
