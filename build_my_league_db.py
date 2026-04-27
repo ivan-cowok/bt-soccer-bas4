@@ -200,7 +200,7 @@ config = {
     "training": {
         "batch_size": 2,
         "grad_accum_steps": 4,
-        "num_epochs": 80,
+        "num_epochs": 50,
         "warm_up_epochs": 3,
         "start_val_epoch": 5,
         "learning_rate": 0.0002,

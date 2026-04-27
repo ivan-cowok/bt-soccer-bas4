@@ -37,7 +37,7 @@ from util.io import load_json, store_json_inference
 
 def get_args():
     p = argparse.ArgumentParser(description="Visualize SoccerNet Ball action spotting on a video")
-    p.add_argument("--video", type=str, default='D:/Data/23.mp4', help="Input video path")
+    p.add_argument("--video", type=str, default='D:/Data/333.mp4', help="Input video path")
     p.add_argument(
         "--output",
         type=str,
