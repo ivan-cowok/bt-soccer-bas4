@@ -1,22 +1,31 @@
 """
 Build AdaSpot training data for soccernetball dataset.
 
-Reads all Labels-ball.json under E:/Database/44/soccer_data,
-performs a 90/10 train/val split (seeded), and writes:
+Reads Labels-ball.json files from the explicit ``train/`` and ``valid/``
+subfolders of E:/Database/44/soccer_data and writes:
   - data/soccernetball/class.txt
   - data/soccernetball/train.json
   - data/soccernetball/val.json
   - config/soccernetball/soccernetball.json
 
-Config sets epoch_num_frames (train) and val_epoch_num_frames (val) separately so
-each val epoch can use fewer random clip steps than train (see dataset/datasets.py).
+The split is no longer random: clips found under ``<LABELS_ROOT>/train`` go
+to train.json and clips under ``<LABELS_ROOT>/valid`` go to val.json. The
+``video`` field of each JSON entry preserves the ``train/...`` or
+``valid/...`` prefix, so the frame folder layout under FRAME_DIR must
+mirror the labels layout (e.g. ``<FRAME_DIR>/train/my_league/...`` and
+``<FRAME_DIR>/valid/my_league/...``).
+
+Config sets epoch_num_frames (train) and val_epoch_num_frames (val)
+separately so each val epoch can use fewer random clip steps than train
+(see dataset/datasets.py).
 
 (No test split / test.json — validation only.)
 
 Also patches util/constants.py with the correct LABELS_SNB_PATH and GAMES_SNB.
 
-Quiet by default (one summary line). Use -v / --verbose for label distribution,
-per-class counts, split details, paths, and the full "next steps" banner.
+Quiet by default (one summary line). Use -v / --verbose for label
+distribution, per-class counts, split details, paths, and the full
+"next steps" banner.
 
 Override per-epoch frame budgets: --train-epoch-frames N --val-epoch-frames M
 (steps per epoch ~= N // clip_len with clip_len=100 in the emitted config).
@@ -28,7 +37,7 @@ Set "num_classes" to the length of that list (or rely on training code to sync).
 """
 
 import argparse
-import json, os, random
+import json, os
 from collections import Counter
 
 # Per-epoch random-clip budgets (steps per epoch ~= value // clip_len; clip_len=100 in config below).
@@ -78,50 +87,82 @@ SAVE_DIR      = os.path.join(ADASPOT_ROOT, 'checkpoints', 'soccernetball')
 
 FPS           = 25          # assumed frame rate for your clips
 BUFFER_SECS   = 2           # extra seconds added after last annotation
-SEED          = 42
-TRAIN_RATIO   = 0.9
 
-# ── Collect all clips ─────────────────────────────────────────────────────────
+# Subfolder names inside LABELS_ROOT that determine the train / val split.
+TRAIN_SUBDIR  = 'train'
+VAL_SUBDIR    = 'valid'
+
+# ── Collect clips per split ──────────────────────────────────────────────────
 # glob does not follow symlinks; use os.walk with followlinks=True instead.
-all_jsons = sorted(
-    os.path.join(root, fname)
-    for root, _dirs, files in os.walk(LABELS_ROOT, followlinks=True)
-    for fname in files
-    if fname == 'Labels-ball.json'
-)
-if VERBOSE:
-    print(f'Found {len(all_jsons)} Labels-ball.json files')
+def _collect_clips(split_root, label_count, skipped):
+    """Walk ``split_root`` and return the list of usable clip dicts.
 
-clips       = []   # list of dicts: {video, num_frames, labels_data}
+    ``rel`` paths are computed against the parent ``LABELS_ROOT`` so they
+    keep the ``train/`` / ``valid/`` prefix; that prefix is what the rest of
+    the pipeline appends to FRAME_DIR to find each clip's frames.
+    """
+    clips = []
+    if not os.path.isdir(split_root):
+        return clips
+
+    jsons = sorted(
+        os.path.join(root, fname)
+        for root, _dirs, files in os.walk(split_root, followlinks=True)
+        for fname in files
+        if fname == 'Labels-ball.json'
+    )
+
+    for jpath in jsons:
+        rel = os.path.relpath(jpath, LABELS_ROOT)
+        rel = os.path.dirname(rel).replace('\\', '/')
+
+        with open(jpath, encoding='utf-8') as f:
+            data = json.load(f)
+        anns = data.get('annotations', [])
+        if not anns:
+            skipped.append(rel)
+            continue
+
+        max_pos_ms = max(int(a['position']) for a in anns)
+        num_frames = int((max_pos_ms / 1000 + BUFFER_SECS) * FPS)
+
+        for a in anns:
+            label_count[a.get('label', '?')] += 1
+
+        clips.append({
+            'video':      rel,
+            'num_frames': num_frames,
+            '_anns':      anns,
+        })
+
+    return clips
+
+
 label_count = Counter()
 skipped     = []
 
-for jpath in all_jsons:
-    # Relative video path (forward slashes, no trailing slash)
-    rel = os.path.relpath(jpath, LABELS_ROOT)           # soccernetball\2026-2027\xxx\Labels-ball.json
-    rel = os.path.dirname(rel).replace('\\', '/')        # soccernetball/2026-2027/xxx
+train_root = os.path.join(LABELS_ROOT, TRAIN_SUBDIR)
+val_root   = os.path.join(LABELS_ROOT, VAL_SUBDIR)
 
-    with open(jpath, encoding='utf-8') as f:
-        data = json.load(f)
-    anns = data.get('annotations', [])
-    if not anns:
-        skipped.append(rel)
-        continue
+if not os.path.isdir(train_root):
+    raise FileNotFoundError(
+        f'Expected train folder at {train_root!r} (containing Labels-ball.json files).'
+    )
+if not os.path.isdir(val_root):
+    raise FileNotFoundError(
+        f'Expected validation folder at {val_root!r} (containing Labels-ball.json files).'
+    )
 
-    # Estimate num_frames from max position in ms
-    max_pos_ms  = max(int(a['position']) for a in anns)
-    num_frames  = int((max_pos_ms / 1000 + BUFFER_SECS) * FPS)
+train_clips = _collect_clips(train_root, label_count, skipped)
+val_clips   = _collect_clips(val_root,   label_count, skipped)
 
-    for a in anns:
-        label_count[a.get('label', '?')] += 1
-
-    clips.append({
-        'video':      rel,
-        'num_frames': num_frames,
-        '_anns':      anns,
-    })
+clips = train_clips + val_clips
 
 if VERBOSE:
+    print(
+        f'Found {len(train_clips)} train + {len(val_clips)} val Labels-ball.json files '
+        f'under {LABELS_ROOT}'
+    )
     print(f'Usable clips: {len(clips)}  |  Skipped (empty): {len(skipped)}')
     print(f'Total annotations: {sum(label_count.values())}')
     print('Label distribution:')
@@ -132,16 +173,7 @@ if VERBOSE:
 class_names = [lab for lab, _ in label_count.most_common()]
 if VERBOSE:
     print(f'\nClasses ({len(class_names)}): {class_names}')
-
-# ── 90/10 split (seeded) ─────────────────────────────────────────────────────
-random.seed(SEED)
-shuffled = clips[:]
-random.shuffle(shuffled)
-n_train   = round(len(shuffled) * TRAIN_RATIO)
-train_clips = shuffled[:n_train]
-val_clips   = shuffled[n_train:]
-if VERBOSE:
-    print(f'\nSplit -> train: {len(train_clips)}  val: {len(val_clips)}')
+    print(f'\nSplit (from folders) -> train: {len(train_clips)}  val: {len(val_clips)}')
 
 # ── Helper: strip internal field, write JSON ─────────────────────────────────
 def to_json_entry(clip):
@@ -194,7 +226,7 @@ config = {
         "clip_len":              100,
         "epoch_num_frames":      TRAIN_EPOCH_FRAMES,
         "val_epoch_num_frames":  VAL_EPOCH_FRAMES,
-        "mixup":                 True,
+        "mixup":                 False,
         "store_mode":            "store"
     },
     "training": {
@@ -237,6 +269,7 @@ config = {
         "astrm_kernel_size": 3,
 
         "blocks_temporal":    [True, True, True, True],
+        "dual_branch":        False,
         "aggregation":        "max",
         "temporal_arch":      "gru",
         "threshold":          0.0,
@@ -317,7 +350,10 @@ if VERBOSE:
     print(f'1. Extract video frames to:  {FRAME_DIR}')
     print('   Naming: frame0.jpg, frame1.jpg, ... at 25 fps')
     print('   Folder per clip:  <FRAME_DIR>/<video_path>/')
-    print('   (e.g., E:\\Database\\44\\soccer_data_frames\\soccernetball\\2026-2027\\0484fd09bc994720bf73cb35545ea9\\frame0.jpg)')
+    print(f'   The <video_path> keeps the {TRAIN_SUBDIR}/ or {VAL_SUBDIR}/ prefix from')
+    print(f'   {LABELS_ROOT}, so the frame folder layout must mirror it.')
+    print('   (e.g., E:\\Database\\44\\soccer_data_frames\\train\\my_league\\2026-2027\\<clip>\\frame0.jpg)')
+    print('   (and    E:\\Database\\44\\soccer_data_frames\\valid\\my_league\\2026-2027\\<clip>\\frame0.jpg)')
     print('2. Train:')
     print('   python main.py --model_name soccernetball --seed 1')
     print('   (first run with store_mode="store", then switch to "load")')

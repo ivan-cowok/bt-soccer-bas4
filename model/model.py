@@ -36,6 +36,12 @@ class AdaSpot(BaseRGBModel):
             self.lowres_loss = args.lowres_loss
             self.highres_loss = args.highres_loss
             self.roi_size = args.roi_size
+            # Dual-branch (low-res + high-res RoI) vs single-branch (low-res
+            # only). In single-branch mode the high-res backbone, RoI
+            # selector, HR transforms, and HR auxiliary head are not built.
+            self._dual_branch = bool(getattr(args, 'dual_branch', True))
+            if not self._dual_branch:
+                self.highres_loss = False
 
             # Get main backbones (low-res and high-res) --> high-res a copy of low-res identical
             # pretrained_backbone=False avoids timm/HF ImageNet download when loading a full checkpoint after.
@@ -76,9 +82,7 @@ class AdaSpot(BaseRGBModel):
 
             self.lowres_backbone = backbone
             # Adapt padding convolutions backbone
-            self.swap_padding(self.lowres_backbone, pad_type=args.padding)  
-
-            self.highres_backbone = copy.deepcopy(self.lowres_backbone)   
+            self.swap_padding(self.lowres_backbone, pad_type=args.padding)
 
             self.lowres_linear = nn.Sequential(
                 nn.Linear(self.d, self.d // 2),
@@ -86,11 +90,20 @@ class AdaSpot(BaseRGBModel):
                 nn.Linear(self.d // 2, self.d)
             )
 
-            self.highres_linear = nn.Sequential(
-                nn.Linear(self.d, self.d // 2),
-                nn.ReLU(),
-                nn.Linear(self.d // 2, self.d)
-            )                            
+            if self._dual_branch:
+                self.highres_backbone = copy.deepcopy(self.lowres_backbone)
+                self.highres_linear = nn.Sequential(
+                    nn.Linear(self.d, self.d // 2),
+                    nn.ReLU(),
+                    nn.Linear(self.d // 2, self.d)
+                )
+            else:
+                self.highres_backbone = None
+                self.highres_linear = None
+                print(
+                    '[branch] Single-branch (low-res only): '
+                    'high-res backbone, RoI selector, and HR head skipped.'
+                )
 
             #Positional encoding (temporal)
             self.temp_enc = nn.Parameter(torch.normal(mean = 0, std = 1 / args.clip_len, size = (args.clip_len, self.d)))
@@ -170,13 +183,17 @@ class AdaSpot(BaseRGBModel):
                 self.softic_proj = None
                 self.softic_loss = None
             
-            #HR and LR resizing
-            self.resizing_hr = T.Resize((args.hr_dim[0], args.hr_dim[1]))
+            #LR resizing / cropping (always built)
             self.resizing_lr = T.Resize((args.lr_dim[0], args.lr_dim[1]))
-
-            #HR and LR cropping (if needed)
-            self.crop_hr = T.CenterCrop((args.hr_crop[0], args.hr_crop[1]))
             self.crop_lr = T.CenterCrop((args.lr_crop[0], args.lr_crop[1]))
+
+            #HR resizing / cropping (only when dual-branch is enabled)
+            if self._dual_branch:
+                self.resizing_hr = T.Resize((args.hr_dim[0], args.hr_dim[1]))
+                self.crop_hr = T.CenterCrop((args.hr_crop[0], args.hr_crop[1]))
+            else:
+                self.resizing_hr = None
+                self.crop_hr = None
 
             #Data augmentations
             self.augmentation = T.Compose([
@@ -208,16 +225,21 @@ class AdaSpot(BaseRGBModel):
 
             # RoI Selector module. ``roi_spatial_increase`` and
             # ``roi_size_step`` come from the config when present; the
-            # defaults match the previous hard-coded behaviour.
-            _roi_inc = int(getattr(args, 'roi_spatial_increase', 8))
-            _roi_step = int(getattr(args, 'roi_size_step', 28))
-            self.roi_selector = ROISelector(
-                roi_size=args.roi_size,
-                spatial_increase=_roi_inc,
-                threshold=args.threshold,
-                original_size=(args.hr_crop[0], args.hr_crop[1]),
-                size_step=_roi_step,
-            )
+            # defaults match the previous hard-coded behaviour. Only built
+            # in dual-branch mode (the selector consumes low-res maps to
+            # locate crops for the high-res branch).
+            if self._dual_branch:
+                _roi_inc = int(getattr(args, 'roi_spatial_increase', 8))
+                _roi_step = int(getattr(args, 'roi_size_step', 28))
+                self.roi_selector = ROISelector(
+                    roi_size=args.roi_size,
+                    spatial_increase=_roi_inc,
+                    threshold=args.threshold,
+                    original_size=(args.hr_crop[0], args.hr_crop[1]),
+                    size_step=_roi_step,
+                )
+            else:
+                self.roi_selector = None
             
             self.do_auxiliar_supervision = True # Set to true as default (to false when preparing model just for inference)
 
@@ -263,17 +285,19 @@ class AdaSpot(BaseRGBModel):
                     self.swap_padding(child, pad_type=pad_type)
 
         def forward(self, x, inference=False):
-            
+
             x = self.normalize(x) #Normalize to 0-1
 
             if not inference:
                 x = self.augment(x) #Augmentations per-batch
 
             x = self.standarize(x)
-            
-            # Resize and crop high-resolution 
-            x_hr = self.resize(x, hr = True)
-            x_hr = self.crop_hr(x_hr)
+
+            # In dual-branch mode the HR view must be derived from the same
+            # standardized tensor BEFORE we overwrite ``x`` with the LR view.
+            if self._dual_branch:
+                x_hr = self.resize(x, hr=True)
+                x_hr = self.crop_hr(x_hr)
 
             # Resize and crop low-resolution
             x = self.resize(x)
@@ -281,42 +305,61 @@ class AdaSpot(BaseRGBModel):
 
             b, t, c, h, w = x.shape
 
-            # Low-res processing
-            im_feat, maps = self.lowres_backbone(x.view(-1, c, h, w), return_last_layer = True) # maps -> BT x C x H' x W'
-            im_feat = im_feat.view(b, t, -1)  # (B, T, C)
+            if self._dual_branch:
+                # Low-res processing (with feature maps for RoI selection)
+                im_feat, maps = self.lowres_backbone(
+                    x.view(-1, c, h, w), return_last_layer=True
+                )  # maps -> BT x C x H' x W'
+                im_feat = im_feat.view(b, t, -1)  # (B, T, C)
 
-            # Get high-res RoIs
-            maps = maps.view(b, t, maps.shape[-3], maps.shape[-2], maps.shape[-1]) # B x T x C x H' x W'
-            centers, sizes = self.roi_selector(maps.detach())
-            rois = self.get_rois(x_hr, centers, sizes)
+                # Get high-res RoIs
+                maps = maps.view(b, t, maps.shape[-3], maps.shape[-2], maps.shape[-1])
+                centers, sizes = self.roi_selector(maps.detach())
+                rois = self.get_rois(x_hr, centers, sizes)
 
-            # High-res processing of RoIs
-            rois_feat = self.highres_backbone(rois.reshape(-1, c, self.roi_size[0], self.roi_size[1]))
-            rois_feat = rois_feat.view(b, t, -1)
-            
-            # Projections
-            im_feat = self.lowres_linear(im_feat)
-            rois_feat = self.highres_linear(rois_feat)
+                # High-res processing of RoIs
+                rois_feat = self.highres_backbone(
+                    rois.reshape(-1, c, self.roi_size[0], self.roi_size[1])
+                )
+                rois_feat = rois_feat.view(b, t, -1)
 
-            # High-res auxiliar supervision
-            if self.highres_loss & self.do_auxiliar_supervision:
-                im_feat_highres = rois_feat + self.temp_enc.expand(b, -1, -1)
-                im_feat_highres = self._temp_fine_highres(im_feat_highres)[0]
-                im_feat_highres = self._pred_fine_highres(im_feat_highres)
+                # Projections
+                im_feat = self.lowres_linear(im_feat)
+                rois_feat = self.highres_linear(rois_feat)
 
-            # Low-res auxiliar supervision
-            if self.lowres_loss & self.do_auxiliar_supervision:
-                im_feat_lowres = im_feat + self.temp_enc.expand(b, -1, -1)
-                im_feat_lowres = self._temp_fine_lowres(im_feat_lowres)[0]
-                im_feat_lowres = self._pred_fine_lowres(im_feat_lowres)
+                # High-res auxiliar supervision
+                if self.highres_loss & self.do_auxiliar_supervision:
+                    im_feat_highres = rois_feat + self.temp_enc.expand(b, -1, -1)
+                    im_feat_highres = self._temp_fine_highres(im_feat_highres)[0]
+                    im_feat_highres = self._pred_fine_highres(im_feat_highres)
 
-            # Low-res + high-res fusion
-            if self.aggregation == 'max':
-                im_feat = torch.stack((im_feat, rois_feat), dim=-1)  # (B, T, C + C)
-                im_feat = im_feat.max(dim=-1)[0]  # (B, T, C)
+                # Low-res auxiliar supervision
+                if self.lowres_loss & self.do_auxiliar_supervision:
+                    im_feat_lowres = im_feat + self.temp_enc.expand(b, -1, -1)
+                    im_feat_lowres = self._temp_fine_lowres(im_feat_lowres)[0]
+                    im_feat_lowres = self._pred_fine_lowres(im_feat_lowres)
+
+                # Low-res + high-res fusion
+                if self.aggregation == 'max':
+                    im_feat = torch.stack((im_feat, rois_feat), dim=-1)  # (B, T, C + C)
+                    im_feat = im_feat.max(dim=-1)[0]  # (B, T, C)
+                else:
+                    raise NotImplementedError(self.aggregation)
             else:
-                raise NotImplementedError(self.aggregation)
-            
+                # Single-branch (low-res only): no RoI, no HR backbone, no
+                # fusion. We don't need the spatial feature maps here, so
+                # call the backbone without ``return_last_layer``.
+                im_feat = self.lowres_backbone(x.view(-1, c, h, w))
+                im_feat = im_feat.view(b, t, -1)
+                im_feat = self.lowres_linear(im_feat)
+
+                # Low-res auxiliary supervision (HR aux is forced off in
+                # single-branch mode by AdaSpot.__init__).
+                if self.lowres_loss & self.do_auxiliar_supervision:
+                    im_feat_lowres = im_feat + self.temp_enc.expand(b, -1, -1)
+                    im_feat_lowres = self._temp_fine_lowres(im_feat_lowres)[0]
+                    im_feat_lowres = self._pred_fine_lowres(im_feat_lowres)
+
             im_feat = im_feat + self.temp_enc.expand(b, -1, -1)  # Add temporal encoding
 
             # Temporal module and prediction head
@@ -437,6 +480,15 @@ class AdaSpot(BaseRGBModel):
             if 'softic_loss' in modules:
                 del self._modules['softic_loss']
                 self.softic_loss = None
+            # In single-branch mode the HR/RoI submodules were registered as
+            # ``None``. Drop them from ``_modules`` so they don't show up in
+            # ``print(model)`` and so ``state_dict()`` is unambiguous.
+            for _name in (
+                'highres_backbone', 'highres_linear', 'roi_selector',
+                'resizing_hr', 'crop_hr',
+            ):
+                if _name in self._modules and self._modules[_name] is None:
+                    del self._modules[_name]
             self._softic_enabled = False
             self.do_auxiliar_supervision = False
             print('Eliminated auxiliary supervision modules not required for inference.')
@@ -446,6 +498,19 @@ class AdaSpot(BaseRGBModel):
         self.device = device
         args_model.lowres_loss = args_training.lowres_loss
         args_model.highres_loss = args_training.highres_loss
+
+        # Single-branch (low-res only) vs dual-branch (low-res + high-res RoI).
+        # When dual_branch is False the high-res backbone, RoI selector, and
+        # HR auxiliary head are omitted; the HR auxiliary loss is forced off.
+        self._dual_branch = bool(getattr(args_model, 'dual_branch', True))
+        args_model.dual_branch = self._dual_branch
+        if not self._dual_branch:
+            if args_model.highres_loss:
+                print(
+                    '[branch] dual_branch=False: forcing highres_loss=False '
+                    '(no high-resolution branch is built).'
+                )
+            args_model.highres_loss = False
 
         cl = getattr(args_training, 'classification_loss', 'ce').lower()
         if cl not in ('ce', 'bce', 'bce_yolo'):

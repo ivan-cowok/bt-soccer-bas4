@@ -325,26 +325,30 @@ def main(args):
         epoch = 0
 
         print('START TRAINING EPOCHS')
-        # Freeze both backbones for the first N epochs so only the temporal
+        # Freeze backbone(s) for the first N epochs so only the temporal
         # model, GRU, and prediction heads adapt to the new class set first.
+        # In single-branch mode ``highres_backbone`` is None and only the
+        # low-res backbone is frozen.
         freeze_epochs = getattr(args.training, 'freeze_backbone_epochs', 0)
         if freeze_epochs > 0:
             for p in model._model.lowres_backbone.parameters():
                 p.requires_grad = False
-            for p in model._model.highres_backbone.parameters():
-                p.requires_grad = False
+            if getattr(model._model, 'highres_backbone', None) is not None:
+                for p in model._model.highres_backbone.parameters():
+                    p.requires_grad = False
             print(f'Backbones frozen for first {freeze_epochs} epoch(s).')
 
         for epoch in range(epoch, num_epochs):
             global _current_epoch
             _current_epoch = epoch
 
-            # Unfreeze backbones once freeze period ends
+            # Unfreeze backbone(s) once freeze period ends
             if freeze_epochs > 0 and epoch == freeze_epochs:
                 for p in model._model.lowres_backbone.parameters():
                     p.requires_grad = True
-                for p in model._model.highres_backbone.parameters():
-                    p.requires_grad = True
+                if getattr(model._model, 'highres_backbone', None) is not None:
+                    for p in model._model.highres_backbone.parameters():
+                        p.requires_grad = True
                 print(f'Epoch {epoch}: backbones unfrozen - full fine-tuning.')
             
             # Train epoch
